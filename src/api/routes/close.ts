@@ -6,43 +6,32 @@ const router = Router();
 
 router.post("/", async (req: Request, res: Response) => {
   try {
-    const { positionId, closePrice, pnl } = req.body;
+    const { symbol, closePrice, pnl } = req.body;
 
-    if (!positionId || !closePrice || pnl === undefined) {
-      res.status(400).json({
-        success: false,
-        error: "Missing required fields: positionId, closePrice, pnl",
-        timestamp: Date.now(),
-      });
+    if (!symbol || !closePrice || pnl === undefined) {
+      res.status(400).json({ error: "Missing symbol, closePrice, or pnl" });
       return;
     }
 
-    logger.info(`Close position request: ${positionId} @ ${closePrice}, PnL: ${pnl}`);
+    logger.info(`Close position: ${symbol} @ ${closePrice} PnL=${pnl}`);
 
-    const position = positionService.closePosition(positionId, closePrice, pnl);
+    const position = positionService.closePosition(symbol, closePrice, pnl);
 
     if (!position) {
-      res.status(404).json({
-        success: false,
-        error: `Position not found: ${positionId}`,
-        timestamp: Date.now(),
-      });
+      res.status(404).json({ error: `No position for ${symbol}` });
       return;
     }
 
-    logger.info(`Position closed: ${positionId}`);
     res.status(200).json({
       success: true,
-      position,
+      symbol,
+      closed: true,
+      pnl,
       timestamp: Date.now(),
     });
   } catch (error: any) {
-    logger.error("Error in close position route:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      timestamp: Date.now(),
-    });
+    logger.error("Error closing position:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
