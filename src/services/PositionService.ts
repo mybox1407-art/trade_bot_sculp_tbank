@@ -1,11 +1,11 @@
-import { v4 as uuidv4 } from "uuid";
 import { Position, ScalpSide, ScalpSignal } from "../types";
 import logger from "../utils/logger";
 
 export class PositionService {
+  // Храним ТОЛЬКО одну позицию на symbol
   private positions: Map<string, Position> = new Map();
 
-  createPosition(
+  openPosition(
     symbol: string,
     side: ScalpSide,
     entryPrice: number,
@@ -14,9 +14,8 @@ export class PositionService {
     quantity: number,
     signal?: ScalpSignal
   ): Position {
-    const id = uuidv4();
     const position: Position = {
-      id,
+      id: symbol,  // symbol как id
       symbol,
       side,
       entryPrice,
@@ -27,67 +26,122 @@ export class PositionService {
       status: "open",
       signal,
     };
-    this.positions.set(id, position);
-    logger.info(`Position created: ${id} | ${symbol} ${side} @ ${entryPrice}`);
+
+    this.positions.set(symbol, position);
+    logger.info(`Position opened: ${symbol} ${side} @ ${entryPrice}`);
     return position;
   }
 
-  getPosition(id: string): Position | undefined {
-    return this.positions.get(id);
+  getPosition(symbol: string): Position | undefined {
+    return this.positions.get(symbol);
   }
 
-  getPositionsBySymbol(symbol: string): Position[] {
-    return Array.from(this.positions.values()).filter((p) => p.symbol === symbol && p.status === "open");
-  }
-
-  getAllOpenPositions(): Position[] {
-    return Array.from(this.positions.values()).filter((p) => p.status === "open");
-  }
-
-  updatePosition(id: string, updates: Partial<Position>): Position | undefined {
-    const position = this.positions.get(id);
+  closePosition(
+    symbol: string,
+    closePrice: number,
+    pnl: number
+  ): Position | undefined {
+    const position = this.positions.get(symbol);
     if (!position) {
-      logger.warn(`Position not found: ${id}`);
+      logger.warn(`No position to close for ${symbol}`);
       return undefined;
     }
-    const updated = { ...position, ...updates };
-    this.positions.set(id, updated);
-    logger.info(`Position updated: ${id}`);
-    return updated;
+
+    position.status = "closed";
+    position.closePrice = closePrice;
+    position.pnl = pnl;
+    position.closeTime = Date.now();
+
+    logger.info(`Position closed: ${symbol} PnL=${pnl}`);
+    return position;
   }
 
-  closePosition(id: string, closePrice: number, pnl: number): Position | undefined {
-    return this.updatePosition(id, {
-      status: "closed",
-      closePrice,
-      pnl,
-      closeTime: Date.now(),
-    });
-  }
+  checkPosition(
+    symbol: string,
+    currentPrice: number
+  ): {
+    hasPosition: boolean;
+    position?: Position;
+    action: "hold" | "close";
+    actionReason?: "take_profit_hit" | "stop_loss_hit" | "time_exit";
+    unrealizedPnl?: number;
+  } {
+    const position = this.positions.get(symbol);
 
-  stopPosition(id: string, closePrice: number, pnl: number): Position | undefined {
-    return this.updatePosition(id, {
-      status: "stopped",
-      closePrice,
-      pnl,
-      closeTime: Date.now(),
-    });
-  }
-
-  deletePosition(id: string): boolean {
-    const deleted = this.positions.delete(id);
-    if (deleted) {
-      logger.info(`Position deleted: ${id}`);
+    if (!position || position.status !== "open") {
+      return { hasPosition: false, action: "hold" };
     }
-    return deleted;
-  }
 
-  clearClosedPositions(): void {
-    const openPositions = Array.from(this.positions.entries()).filter(
-      ([_, p]) => p.status === "open"
-    );
-    this.positions = new Map(openPositions);
-    logger.info("Cleared closed positions");
+    const entryPrice = position.entryPrice;
+    const sl = position.stopLossPrice;
+    const tp = position.takeProfitPrice;
+
+    let unrealizedPnl = 0;
+    if (position.side === "long") {
+      unrealizedPnl = (currentPrice - entryPrice) * position.quantity;
+    } else {
+      unrealizedPnl = (entryPrice - currentPrice) * position.quantity;
+    }
+
+    // Проверка TP/SL
+    if (position.side === "long") {
+      if (currentPrice >= tp) {
+        return {
+          hasPosition: true,
+          position,
+          action: "close",
+          actionReason: "take_profit_hit",
+          unrealizedPnl,
+        };
+      }
+      if (currentPrice <= sl) {
+        return {
+          hasPosition: true,
+          position,
+          action: "close",
+          actionReason: "stop_loss_hit",
+          unrealizedPnl,
+        };
+      }
+    } else {
+      if (currentPrice <= tp) {
+        return {
+          hasPosition: true,
+          position,
+          action: "close",
+          actionReason: "take_profit_hit",
+          unrealizedPnl,
+        };
+      }
+      if (currentPrice >= sl) {
+        return {
+          hasPosition: true,
+          position,
+          action: "close",
+          actionReason: "stop_loss_hit",
+          unrealizedPnl,
+        };
+      }
+    }
+
+    // Time-based exit (опционально)
+    const holdTimeMin = (Date.now() - position.entryTime) / 1000 / 60;
+    if (holdTimeMin > 30) {  // 30 минут макс
+      return {
+        hasPosition: true,
+        position,
+        action: "close",
+        actionReason: "time_exit",
+        unrealizedPnl,
+      };
+    }
+
+    return {
+      hasPosition: true,
+      position,
+      action: "hold",
+      unrealizedPnl,
+    };
   }
 }
 
