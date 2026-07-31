@@ -13,24 +13,32 @@ router.get("/", async (req: Request, res: Response) => {
       return;
     }
 
-    // Если есть currentPrice — проверяем TP/SL
-    if (currentPrice && typeof currentPrice === "string") {
-      const price = parseFloat(currentPrice);
-      const result = positionService.checkPosition(symbol, price);
-
-      logger.info(`Position check ${symbol}: action=${result.action}`);
-      res.status(200).json(result);
-    } else {
-      // Просто проверка есть ли позиция
+    // Если нет currentPrice — просто проверка
+    if (!currentPrice || typeof currentPrice !== "string") {
       const position = positionService.getPosition(symbol);
       res.status(200).json({
         hasPosition: !!position,
         position: position || null,
+        timestamp: Date.now(),
       });
+      return;
     }
+
+    // Есть currentPrice — проверяем TP/SL и закрываем если нужно
+    const price = parseFloat(currentPrice);
+    const result = positionService.checkAndClosePosition(symbol, price);
+
+    logger.info(
+      `Position check ${symbol}: action=${result.action}, closed=${result.closed}`
+    );
+
+    res.status(200).json({
+      ...result,
+      timestamp: Date.now(),
+    });
   } catch (error: any) {
     logger.error("Error in position route:", error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message, timestamp: Date.now() });
   }
 });
 
