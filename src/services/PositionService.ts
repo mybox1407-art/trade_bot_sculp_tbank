@@ -2,7 +2,6 @@ import { Position, ScalpSide, ScalpSignal } from "../types";
 import logger from "../utils/logger";
 
 export class PositionService {
-  // Храним ТОЛЬКО одну позицию на symbol
   private positions: Map<string, Position> = new Map();
 
   openPosition(
@@ -15,7 +14,7 @@ export class PositionService {
     signal?: ScalpSignal
   ): Position {
     const position: Position = {
-      id: symbol,  // symbol как id
+      id: symbol,
       symbol,
       side,
       entryPrice,
@@ -36,11 +35,7 @@ export class PositionService {
     return this.positions.get(symbol);
   }
 
-  closePosition(
-    symbol: string,
-    closePrice: number,
-    pnl: number
-  ): Position | undefined {
+  closePosition(symbol: string, closePrice: number, pnl: number): Position | undefined {
     const position = this.positions.get(symbol);
     if (!position) {
       logger.warn(`No position to close for ${symbol}`);
@@ -56,7 +51,7 @@ export class PositionService {
     return position;
   }
 
-  checkPosition(
+  checkAndClosePosition(
     symbol: string,
     currentPrice: number
   ): {
@@ -65,11 +60,13 @@ export class PositionService {
     action: "hold" | "close";
     actionReason?: "take_profit_hit" | "stop_loss_hit" | "time_exit";
     unrealizedPnl?: number;
+    closed: boolean;
+    realizedPnl?: number;
   } {
     const position = this.positions.get(symbol);
 
     if (!position || position.status !== "open") {
-      return { hasPosition: false, action: "hold" };
+      return { hasPosition: false, action: "hold", closed: false };
     }
 
     const entryPrice = position.entryPrice;
@@ -83,56 +80,48 @@ export class PositionService {
       unrealizedPnl = (entryPrice - currentPrice) * position.quantity;
     }
 
+    let action: "hold" | "close" = "hold";
+    let actionReason: "take_profit_hit" | "stop_loss_hit" | "time_exit" | undefined;
+
     // Проверка TP/SL
     if (position.side === "long") {
       if (currentPrice >= tp) {
-        return {
-          hasPosition: true,
-          position,
-          action: "close",
-          actionReason: "take_profit_hit",
-          unrealizedPnl,
-        };
-      }
-      if (currentPrice <= sl) {
-        return {
-          hasPosition: true,
-          position,
-          action: "close",
-          actionReason: "stop_loss_hit",
-          unrealizedPnl,
-        };
+        action = "close";
+        actionReason = "take_profit_hit";
+      } else if (currentPrice <= sl) {
+        action = "close";
+        actionReason = "stop_loss_hit";
       }
     } else {
       if (currentPrice <= tp) {
-        return {
-          hasPosition: true,
-          position,
-          action: "close",
-          actionReason: "take_profit_hit",
-          unrealizedPnl,
-        };
-      }
-      if (currentPrice >= sl) {
-        return {
-          hasPosition: true,
-          position,
-          action: "close",
-          actionReason: "stop_loss_hit",
-          unrealizedPnl,
-        };
+        action = "close";
+        actionReason = "take_profit_hit";
+      } else if (currentPrice >= sl) {
+        action = "close";
+        actionReason = "stop_loss_hit";
       }
     }
 
     // Time-based exit (опционально)
-    const holdTimeMin = (Date.now() - position.entryTime) / 1000 / 60;
-    if (holdTimeMin > 30) {  // 30 минут макс
+    if (action === "hold") {
+      const holdTimeMin = (Date.now() - position.entryTime) / 1000 / 60;
+      if (holdTimeMin > 30) {
+        action = "close";
+        actionReason = "time_exit";
+      }
+    }
+
+    // Если надо закрывать — закрываем
+    if (action === "close") {
+      this.closePosition(symbol, currentPrice, unrealizedPnl);
       return {
         hasPosition: true,
         position,
         action: "close",
-        actionReason: "time_exit",
+        actionReason,
         unrealizedPnl,
+        closed: true,
+        realizedPnl: unrealizedPnl,
       };
     }
 
@@ -141,6 +130,7 @@ export class PositionService {
       position,
       action: "hold",
       unrealizedPnl,
+      closed: false,
     };
   }
 }
