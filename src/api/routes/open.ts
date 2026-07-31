@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import { positionService } from "../../services/PositionService";
-import { OpenPositionRequest, OpenPositionResponse, ScalpSide } from "../../types";
+import { ScalpSide } from "../../types";
 import logger from "../../utils/logger";
 
 const router = Router();
@@ -10,26 +10,13 @@ router.post("/", async (req: Request, res: Response) => {
     const { symbol, side, quantity, stopLossPrice, takeProfitPrice, entryPrice } = req.body;
 
     if (!symbol || !side || !quantity || !stopLossPrice || !takeProfitPrice || !entryPrice) {
-      res.status(400).json({
-        success: false,
-        error: "Missing required fields: symbol, side, quantity, stopLossPrice, takeProfitPrice, entryPrice",
-        timestamp: Date.now(),
-      });
+      res.status(400).json({ error: "Missing required fields" });
       return;
     }
 
-    if (side !== "long" && side !== "short") {
-      res.status(400).json({
-        success: false,
-        error: "Invalid side. Must be 'long' or 'short'",
-        timestamp: Date.now(),
-      });
-      return;
-    }
+    logger.info(`Open position: ${symbol} ${side} @ ${entryPrice}`);
 
-    logger.info(`Open position request: ${symbol} ${side} qty=${quantity} @ ${entryPrice}`);
-
-    const position = positionService.createPosition(
+    const position = positionService.openPosition(
       symbol,
       side as ScalpSide,
       entryPrice,
@@ -38,21 +25,16 @@ router.post("/", async (req: Request, res: Response) => {
       quantity
     );
 
-    const response: OpenPositionResponse = {
+    res.status(201).json({
       success: true,
-      position,
-      timestamp: Date.now(),
-    };
-
-    logger.info(`Position opened: ${position.id}`);
-    res.status(201).json(response);
-  } catch (error: any) {
-    logger.error("Error in open position route:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
+      symbol: position.symbol,
+      side: position.side,
+      entryPrice: position.entryPrice,
       timestamp: Date.now(),
     });
+  } catch (error: any) {
+    logger.error("Error opening position:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
