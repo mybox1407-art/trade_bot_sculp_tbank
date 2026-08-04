@@ -1,9 +1,14 @@
 import { Router, Request, Response } from 'express';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const router = Router();
 
-let virtualBalance = 1000000;
-const COMMISSION_RATE = 0.0005;
+const VIRTUAL_BALANCE = parseFloat(process.env.VIRTUAL_BALANCE || '50000');
+const COMMISSION_RATE = parseFloat(process.env.COMMISSION_RATE || '0.0005');
+
+let virtualBalance = VIRTUAL_BALANCE;
 
 router.post('/position/open', async (req: Request, res: Response) => {
   try {
