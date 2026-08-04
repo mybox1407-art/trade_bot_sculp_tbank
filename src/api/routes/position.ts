@@ -1,9 +1,14 @@
 import { Router, Request, Response } from 'express';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const router = Router();
 
-const COMMISSION_RATE = 0.0005;
-const openPositions = new Map();
+const COMMISSION_RATE = parseFloat(process.env.COMMISSION_RATE || '0.0005');
+const VIRTUAL_BALANCE = parseFloat(process.env.VIRTUAL_BALANCE || '50000');
+
+const openPositions: Map<string, any> = new Map();
 
 router.post('/position/check-close', async (req: Request, res: Response) => {
   try {
@@ -11,7 +16,7 @@ router.post('/position/check-close', async (req: Request, res: Response) => {
     if (!symbol || !currentPrice) return res.status(400).json({ error: 'Symbol and currentPrice required' });
 
     const position = openPositions.get(symbol);
-    if (!position) return res.json({ action: 'none', result: { balance: 1000000, lastClosedTrade: null } });
+    if (!position) return res.json({ action: 'none', result: { balance: VIRTUAL_BALANCE, lastClosedTrade: null } });
 
     const { side, entryPrice, quantity, takeProfitPrice, stopLossPrice, commissionOpen } = position;
     let reason = null;
@@ -24,7 +29,7 @@ router.post('/position/check-close', async (req: Request, res: Response) => {
       else if (currentPrice >= stopLossPrice) reason = 'sl';
     }
 
-    if (!reason) return res.json({ action: 'none', result: { balance: 1000000, lastClosedTrade: null } });
+    if (!reason) return res.json({ action: 'none', result: { balance: VIRTUAL_BALANCE, lastClosedTrade: null } });
 
     const notionalExit = currentPrice * quantity;
     const commissionClose = notionalExit * COMMISSION_RATE;
@@ -35,7 +40,7 @@ router.post('/position/check-close', async (req: Request, res: Response) => {
 
     const closedTrade = { symbol, side, exitPrice: currentPrice, closedAt: new Date().toISOString(), reason, realizedPnL, commissionOpen, commissionClose };
 
-    res.json({ action: 'closed', result: { balance: 1000000 + realizedPnL, lastClosedTrade: closedTrade } });
+    res.json({ action: 'closed', result: { balance: VIRTUAL_BALANCE + realizedPnL, lastClosedTrade: closedTrade } });
   } catch (error) {
     console.error('Error in /position/check-close:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -51,7 +56,7 @@ router.post('/position/open', async (req: Request, res: Response) => {
 
     const notional = entryPrice * quantity;
     const commissionOpen = notional * COMMISSION_RATE;
-    const balanceBefore = 1000000;
+    const balanceBefore = VIRTUAL_BALANCE;
     const balanceAfter = balanceBefore - commissionOpen;
 
     const position = { symbol, side, entryPrice, quantity, notional, takeProfitPrice, stopLossPrice, openedAt: new Date().toISOString(), commissionOpen };
