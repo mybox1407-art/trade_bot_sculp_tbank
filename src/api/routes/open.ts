@@ -1,40 +1,21 @@
-import { Router, Request, Response } from "express";
-import { positionService } from "../../services/PositionService";
-import { ScalpSide } from "../../types";
-import logger from "../../utils/logger";
+import { Router, Request, Response } from 'express';
 
 const router = Router();
 
-router.post("/", async (req: Request, res: Response) => {
+router.post('/position/open', async (req: Request, res: Response) => {
   try {
-    const { symbol, side, quantity, stopLossPrice, takeProfitPrice, entryPrice } = req.body;
-
-    if (!symbol || !side || !quantity || !stopLossPrice || !takeProfitPrice || !entryPrice) {
-      res.status(400).json({ error: "Missing required fields" });
-      return;
+    const { symbol, takeProfitPrice, stopLossPrice, side, positionSize, quantity } = req.body;
+    if (!symbol || !takeProfitPrice || !stopLossPrice || !side || !quantity) {
+      return res.status(400).json({ error: 'Missing required fields' });
     }
-
-    logger.info(`Open position: ${symbol} ${side} @ ${entryPrice}`);
-
-    const position = positionService.openPosition(
-      symbol,
-      side as ScalpSide,
-      entryPrice,
-      stopLossPrice,
-      takeProfitPrice,
-      quantity
-    );
-
-    res.status(201).json({
-      success: true,
-      symbol: position.symbol,
-      side: position.side,
-      entryPrice: position.entryPrice,
-      timestamp: Date.now(),
-    });
-  } catch (error: any) {
-    logger.error("Error opening position:", error);
-    res.status(500).json({ error: error.message });
+    const entryPrice = takeProfitPrice;
+    const notional = entryPrice * quantity;
+    const virtualBalance = 1000000;
+    const position = { symbol, side, entryPrice, quantity, notional, takeProfitPrice, stopLossPrice, openedAt: new Date().toISOString() };
+    res.json({ balance: virtualBalance, position });
+  } catch (error) {
+    console.error('Error in /position/open:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
