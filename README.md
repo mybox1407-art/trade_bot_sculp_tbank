@@ -4,7 +4,7 @@
 
 **API-сервис для n8n** (paper trading):
 - Расчёт торговых сигналов (скальпинг стратегия)
-- Виртуальное открытие/закрытие позиций с учётом комиссии
+- Виртуальное открытие/закрытие позиций с учётом комиссии T-Invest (0.05% за сделку)
 - Определение рыночного режима (normal / high_volatility / no_data)
 
 ## Architecture
@@ -76,8 +76,8 @@ n8n → Telegram (notifications)
 **Response:**
 ```json
 {
-  "balance": 999985.75,
-  "balanceBefore": 1000000,
+  "balance": 49985.75,
+  "balanceBefore": 50000,
   "commissionOpen": 14.25,
   "position": {
     "symbol": "TCSG",
@@ -105,7 +105,7 @@ n8n → Telegram (notifications)
 {
   "action": "closed",
   "result": {
-    "balance": 1000335.5,
+    "balance": 50335.5,
     "lastClosedTrade": {
       "symbol": "TCSG",
       "side": "long",
@@ -125,7 +125,7 @@ n8n → Telegram (notifications)
 {
   "action": "none",
   "result": {
-    "balance": 1000000,
+    "balance": 50000,
     "lastClosedTrade": null
   }
 }
@@ -133,7 +133,7 @@ n8n → Telegram (notifications)
 
 ## Mode
 
-- **Paper Trading** (по умолчанию): Виртуальные сделки с учётом комиссии (0.05% на круг), реальные ордера НЕ отправляются
+- **Paper Trading** (по умолчанию): Виртуальные сделки с учётом комиссии T-Invest (0.05% за сделку = 0.1% на круг), реальные ордера НЕ отправляются
 - **Live Trading**: В разработке (требует интеграции с T-Invest API)
 
 ## Environment Variables
@@ -141,8 +141,11 @@ n8n → Telegram (notifications)
 ```bash
 # .env.example
 PORT=3011
-TINKOFF_API_KEY=your_api_key
-TINKOFF_ACCOUNT_ID=your_account_id
+TINKOFF_API_KEY=your_api_key_here
+TINKOFF_ACCOUNT_ID=your_account_id_here
+VIRTUAL_BALANCE=50000
+COMMISSION_RATE=0.0005
+TIMEFRAME=1m
 ```
 
 ## n8n Integration
