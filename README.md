@@ -4,8 +4,8 @@
 
 **API-сервис для n8n** (paper trading):
 - Расчёт торговых сигналов (скальпинг стратегия)
-- Виртуальное открытие/закрытие позиций
-- Определение рыночного режима
+- Виртуальное открытие/закрытие позиций с учётом комиссии
+- Определение рыночного режима (normal / high_volatility / no_data)
 
 ## Architecture
 
@@ -68,23 +68,27 @@ n8n → Telegram (notifications)
   "stopLossPrice": 284.0,
   "side": "long",
   "positionSize": 0.02,
-  "quantity": 100
+  "quantity": 100,
+  "entryPrice": 285.5
 }
 ```
 
 **Response:**
 ```json
 {
-  "balance": 1000000,
+  "balance": 999985.75,
+  "balanceBefore": 1000000,
+  "commissionOpen": 14.25,
   "position": {
     "symbol": "TCSG",
     "side": "long",
-    "entryPrice": 287.0,
+    "entryPrice": 285.5,
     "quantity": 100,
-    "notional": 28700,
+    "notional": 28550,
     "takeProfitPrice": 287.0,
     "stopLossPrice": 284.0,
-    "openedAt": "2025-01-15T10:30:00.000Z"
+    "openedAt": "2025-01-15T10:30:00.000Z",
+    "commissionOpen": 14.25
   }
 }
 ```
@@ -93,10 +97,30 @@ n8n → Telegram (notifications)
 
 **Request:**
 ```json
-{ "symbol": "TCSG" }
+{ "symbol": "TCSG", "currentPrice": 289.0 }
 ```
 
-**Response:**
+**Response (закрытие по TP):**
+```json
+{
+  "action": "closed",
+  "result": {
+    "balance": 1000335.5,
+    "lastClosedTrade": {
+      "symbol": "TCSG",
+      "side": "long",
+      "exitPrice": 289.0,
+      "closedAt": "2025-01-15T11:00:00.000Z",
+      "reason": "tp",
+      "realizedPnL": 335.5,
+      "commissionOpen": 14.25,
+      "commissionClose": 14.45
+    }
+  }
+}
+```
+
+**Response (позиция не закрыта):**
 ```json
 {
   "action": "none",
@@ -109,7 +133,7 @@ n8n → Telegram (notifications)
 
 ## Mode
 
-- **Paper Trading** (по умолчанию): Виртуальные сделки, реальные ордера НЕ отправляются
+- **Paper Trading** (по умолчанию): Виртуальные сделки с учётом комиссии (0.05% на круг), реальные ордера НЕ отправляются
 - **Live Trading**: В разработке (требует интеграции с T-Invest API)
 
 ## Environment Variables
@@ -124,11 +148,12 @@ TINKOFF_ACCOUNT_ID=your_account_id
 ## n8n Integration
 
 Этот бот спроектирован для работы с n8n workflow:
-1. n8n вызывает `/bot/run` для получения сигнала
-2. Если сигнал есть → n8n вызывает `/position/open` для виртуального открытия
-3. n8n делает INSERT в PostgreSQL (signals, positions)
-4. n8n отправляет Telegram уведомление
-5. По расписанию n8n вызывает `/position/check-close` для проверки закрытия
+1. n8n вызывает `/market/regime` → проверка `ready` и `regime !== 'high_volatility'`
+2. n8n вызывает `/bot/run` для получения сигнала
+3. Если сигнал есть → n8n вызывает `/position/open` для виртуального открытия (с комиссией)
+4. n8n делает INSERT в PostgreSQL (signals, positions)
+5. n8n отправляет Telegram уведомление
+6. По расписанию n8n вызывает `/position/check-close` с `currentPrice` для проверки TP/SL и получения `realizedPnL`
 
 ## Development
 
