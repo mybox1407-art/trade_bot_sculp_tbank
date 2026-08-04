@@ -1,91 +1,42 @@
-import { Router, Request, Response } from "express";
-import { candleService } from "../../services/CandleService";
-import {
-  build1mIndicators,
-  build5mIndicators,
-  aggregateCandlesTo5m,
-  evaluateMomentumScalpEntry,
-  DEFAULT_SCALP_PARAMS,
-} from "../../services/ScalpStrategy";
-import { SignalResponse } from "../../types";
-import logger from "../../utils/logger";
+import { Router, Request, Response } from 'express';
+import { ScalpStrategy } from '../../services/ScalpStrategy';
+import { CandleService } from '../../services/CandleService';
+import { Config } from '../../config';
 
 const router = Router();
+const scalpStrategy = new ScalpStrategy();
+const candleService = new CandleService();
+const config = Config.getInstance();
 
-router.get("/", async (req: Request, res: Response) => {
+router.post('/bot/run', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.query;
-
-    if (!symbol || typeof symbol !== "string") {
-      res.status(400).json({
-        success: false,
-        error: "Missing or invalid 'symbol' query parameter",
-        timestamp: Date.now(),
-      } as SignalResponse);
-      return;
+    const { symbol } = req.body;
+    if (!symbol) return res.status(400).json({ error: 'Symbol is required' });
+    const candles = await candleService.getCandles(symbol);
+    if (!candles || candles.length === 0) {
+      return res.json({ symbol, timeframe: config.timeframe, ready: false, price: 0, buy: false, sell: false, side: 'none', regime: 'no_data', positionSize: null, takeProfitPrice: null, stopLossPrice: null, indicators: { lastRsi: null, lastAtr: null, ready: false } });
     }
+    const signal = scalpStrategy.calculateSignal(candles, symbol);
+    const lastCandle = candles[candles.length - 1];
+    const price = lastCandle.close;
+    res.json({ symbol, timeframe: config.timeframe, ready: signal.ready, price, buy: signal.buy, sell: signal.sell, side: signal.side, regime: signal.regime, positionSize: signal.positionSize ?? null, takeProfitPrice: signal.takeProfitPrice ?? null, stopLossPrice: signal.stopLossPrice ?? null, indicators: { lastRsi: signal.indicators?.lastRsi ?? null, lastAtr: signal.indicators?.lastAtr ?? null, ready: signal.indicators?.ready ?? false } });
+  } catch (error) {
+    console.error('Error in /bot/run:', error);
+    res.status(500).json({ error: 'Internal server error', symbol: req.body.symbol, ready: false, buy: false, sell: false, side: 'none', regime: 'error', indicators: { ready: false } });
+  }
+});
 
-    logger.info(`Signal check requested for ${symbol}`);
-
-    const { candles1m, candles5m } = await candleService.getCandlesForSignal(symbol);
-
-    if (candles1m.length < 20 || candles5m.length < 10) {
-      res.status(200).json({
-        success: true,
-        symbol,
-        signal: null,
-        reason: "not_enough_history",
-        indicators: { atr1m: null, atr5m: null, vwap1m: null, emaFast5m: null, emaSlow5m: null },
-        candlesCount: candles1m.length,
-        timestamp: Date.now(),
-      });
-      return;
-    }
-
-    const indicators1m = build1mIndicators(candles1m, DEFAULT_SCALP_PARAMS);
-    const candles5mAggregated = aggregateCandlesTo5m(candles1m);
-    const indicators5m = build5mIndicators(candles5mAggregated, DEFAULT_SCALP_PARAMS);
-
-    const signalIndex = candles1m.length - 3;
-    const decision = evaluateMomentumScalpEntry(
-      candles1m,
-      indicators1m,
-      candles5mAggregated,
-      indicators5m,
-      signalIndex,
-      DEFAULT_SCALP_PARAMS
-    );
-
-    const lastInd1m = indicators1m[indicators1m.length - 1];
-    const lastInd5m = indicators5m[indicators5m.length - 1];
-
-    const response: SignalResponse = {
-      success: true,
-      symbol,
-      signal: decision.accepted && decision.signal ? decision.signal : null,
-      reason: decision.accepted ? undefined : decision.reason,
-      indicators: {
-        atr1m: lastInd1m?.atr1m ?? null,
-        atr5m: lastInd5m?.atr5m ?? null,
-        vwap1m: lastInd1m?.vwap1m ?? null,
-        emaFast5m: lastInd5m?.emaFast5m ?? null,
-        emaSlow5m: lastInd5m?.emaSlow5m ?? null,
-      },
-      candlesCount: candles1m.length,
-      timestamp: Date.now(),
-    };
-
-    logger.info(`Signal for ${symbol}: ${decision.accepted ? decision.signal?.side : decision.reason}`);
-    res.status(200).json(response);
-  } catch (error: any) {
-    logger.error("Error in signal route:", error);
-    res.status(500).json({
-      success: false,
-      symbol: req.query.symbol as string,
-      signal: null,
-      error: error.message,
-      timestamp: Date.now(),
-    });
+router.post('/market/regime', async (req: Request, res: Response) => {
+  try {
+    const { symbol } = req.body;
+    if (!symbol) return res.status(400).json({ error: 'Symbol is required' });
+    const candles = await candleService.getCandles(symbol);
+    if (!candles || candles.length === 0) return res.json({ symbol, regime: 'no_data', ready: false });
+    const regime = scalpStrategy.determineRegime(candles);
+    res.json({ symbol, regime: regime.regime, ready: regime.ready });
+  } catch (error) {
+    console.error('Error in /market/regime:', error);
+    res.status(500).json({ error: 'Internal server error', symbol: req.body.symbol, regime: 'error', ready: false });
   }
 });
 
