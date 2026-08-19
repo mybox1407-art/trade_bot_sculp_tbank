@@ -2,22 +2,46 @@ import axios from "axios";
 import config from "../config";
 import logger from "../utils/logger";
 
+export interface OpenedPositionNotification {
+  symbol: string;
+  side: string;
+  quantity: number;
+  entryPrice: number;
+  stopLossPrice: number;
+  takeProfitPrice: number;
+  commissionOpen: number;
+  notional: number;
+}
+
+export interface ClosedPositionNotification {
+  symbol: string;
+  side: string;
+  quantity: number;
+  entryPrice: number;
+  closePrice: number;
+  pnl: number;
+  grossPnl: number;
+  commissionOpen: number;
+  commissionClose: number;
+  closeReason: string;
+}
+
 export class TelegramService {
   private readonly enabled: boolean;
   private readonly botToken: string;
   private readonly chatId: string;
 
   constructor() {
-    this.enabled =
-      config.telegramEnabled &&
-      Boolean(config.telegramBotToken) &&
-      Boolean(config.telegramChatId);
-
     this.botToken =
       config.telegramBotToken;
 
     this.chatId =
       config.telegramChatId;
+
+    this.enabled =
+      config.telegramEnabled &&
+      Boolean(this.botToken) &&
+      Boolean(this.chatId);
 
     if (!this.enabled) {
       logger.warn(
@@ -52,17 +76,30 @@ export class TelegramService {
     }
   }
 
+  async notifyBotStarted(
+    symbols: string[]
+  ): Promise<void> {
+    const message = [
+      "🤖 Бот запущен",
+      "",
+      `Режим: ${config.tradingMode}`,
+      `Инструменты: ${symbols.join(", ")}`,
+      `Начальный баланс: ${config.virtualBalance.toFixed(2)} RUB`,
+      `Максимум открытых сделок: ${config.maxOpenPositions}`,
+      `Лимит одной сделки: ${(config.maxPositionNotionalPct * 100).toFixed(0)}% динамического баланса`
+    ].join("\n");
+
+    await this.sendMessage(message);
+  }
+
+  async notifyBotStopped(): Promise<void> {
+    await this.sendMessage(
+      "🛑 Бот остановлен"
+    );
+  }
+
   async notifyPositionOpened(
-    position: {
-      symbol: string;
-      side: string;
-      quantity: number;
-      entryPrice: number;
-      stopLossPrice: number;
-      takeProfitPrice: number;
-      commissionOpen: number;
-      notional: number;
-    }
+    position: OpenedPositionNotification
   ): Promise<void> {
     const icon =
       position.side === "long"
@@ -79,7 +116,7 @@ export class TelegramService {
       `Stop-loss: ${position.stopLossPrice}`,
       `Take-profit: ${position.takeProfitPrice}`,
       `Объём: ${position.notional.toFixed(2)} RUB`,
-      `Комиссия: ${position.commissionOpen.toFixed(2)} RUB`,
+      `Комиссия открытия: ${position.commissionOpen.toFixed(2)} RUB`,
       `Режим: ${config.tradingMode}`
     ].join("\n");
 
@@ -87,18 +124,7 @@ export class TelegramService {
   }
 
   async notifyPositionClosed(
-    position: {
-      symbol: string;
-      side: string;
-      quantity: number;
-      entryPrice: number;
-      closePrice: number;
-      pnl: number;
-      grossPnl: number;
-      commissionOpen: number;
-      commissionClose: number;
-      closeReason: string;
-    }
+    position: ClosedPositionNotification
   ): Promise<void> {
     const icon =
       position.pnl >= 0
@@ -116,8 +142,8 @@ export class TelegramService {
       `Причина: ${position.closeReason}`,
       `Gross PnL: ${position.grossPnl.toFixed(2)} RUB`,
       `Net PnL: ${position.pnl.toFixed(2)} RUB`,
-      `Комиссия входа: ${position.commissionOpen.toFixed(2)} RUB`,
-      `Комиссия выхода: ${position.commissionClose.toFixed(2)} RUB`,
+      `Комиссия открытия: ${position.commissionOpen.toFixed(2)} RUB`,
+      `Комиссия закрытия: ${position.commissionClose.toFixed(2)} RUB`,
       `Режим: ${config.tradingMode}`
     ].join("\n");
 
@@ -128,43 +154,19 @@ export class TelegramService {
     context: string,
     error: unknown
   ): Promise<void> {
-    const message =
+    const errorMessage =
       error instanceof Error
         ? error.message
         : String(error);
 
-    await this.sendMessage(
-      [
-        "⚠️ Ошибка бота",
-        "",
-        `Контекст: ${context}`,
-        `Сообщение: ${message}`
-      ].join("\n")
-    );
-  }
+    const message = [
+      "⚠️ Ошибка бота",
+      "",
+      `Контекст: ${context}`,
+      `Сообщение: ${errorMessage}`
+    ].join("\n");
 
-  async notifyBotStarted(
-    symbols: string[]
-  ): Promise<void> {
-    await this.sendMessage(
-      [
-        "🤖 Бот запущен",
-        "",
-        `Режим: ${config.tradingMode}`,
-        `Инструменты: ${symbols.join(", ")}`,
-        `Максимум позиций: ${config.maxOpenPositions}`,
-        `Лимит на позицию: ${(
-          config.maxPositionNotionalPct *
-          100
-        ).toFixed(0)}%`
-      ].join("\n")
-    );
-  }
-
-  async notifyBotStopped(): Promise<void> {
-    await this.sendMessage(
-      "🛑 Бот остановлен"
-    );
+    await this.sendMessage(message);
   }
 }
 
