@@ -23,11 +23,13 @@ export type EntryRejectReason =
   | 'impulse_too_small'
   | 'target_too_small_for_costs'
   | 'too_far_from_vwap'
+  | 'invalid_data'
   | 'no_signal';
 
 export interface ScalpParams {
   riskPerTrade: number;
   maxRiskPerTrade: number;
+
   commissionRate: number;
   slippageRate: number;
 
@@ -47,6 +49,9 @@ export interface ScalpParams {
   minImpulseBodyPct: number;
   volumeMinRatio1m: number;
 
+  minCloseLocationLong: number;
+  maxCloseLocationShort: number;
+
   atrSlMult: number;
   atrTpMult: number;
   timeStopBars: number;
@@ -59,24 +64,43 @@ export interface ScalpParams {
 
   sessionStartHour: number;
   sessionEndHour: number;
+
+  sessionTimezone?: 'UTC';
+  contractMultiplier?: number;
 }
 
 export interface ScalpSignal {
   side: ScalpSide;
+
   signalIndex: number;
   entryIndex: number;
+
   signalTime: number;
   entryTime: number;
+
+  rawEntryPrice: number;
+  triggerPrice: number;
   entryPrice: number;
+
   stopLossPrice: number;
   takeProfitPrice: number;
+
   riskDistance: number;
+
   atr1m: number;
   atr5m: number;
   vwap1m: number;
+
   impulseBodyPct: number;
+  closeLocation: number;
   pullbackPct: number;
   volumeRatio: number;
+
+  entryCommissionPct: number;
+  estimatedExitCommissionPct: number;
+  estimatedRoundTripSlippagePct: number;
+  estimatedRoundTripCostPct: number;
+  expectedNetTargetMovePct: number;
 }
 
 export interface EntryDecision {
@@ -99,9 +123,20 @@ export interface BarIndicators5m {
   close5m: number | null;
 }
 
+export interface PositionSizeInput {
+  equity: number;
+  entryPrice: number;
+  stopPrice: number;
+  riskPerTrade: number;
+  maxRiskPerTrade: number;
+  maxPositionNotionalPct: number;
+  contractMultiplier?: number;
+}
+
 export const DEFAULT_SCALP_PARAMS: ScalpParams = {
   riskPerTrade: 0.005,
   maxRiskPerTrade: 0.005,
+
   commissionRate: 0.0002,
   slippageRate: 0.00015,
 
@@ -121,72 +156,171 @@ export const DEFAULT_SCALP_PARAMS: ScalpParams = {
   minImpulseBodyPct: 0.0008,
   volumeMinRatio1m: 1.1,
 
+  minCloseLocationLong: 0.65,
+  maxCloseLocationShort: 0.35,
+
   atrSlMult: 1.15,
   atrTpMult: 2.0,
   timeStopBars: 16,
   cooldownBars: 4,
 
-  minTargetMovePct: 0.0020,
+  minTargetMovePct: 0.002,
   minCostCoverage: 2.0,
   maxEntryDistanceFromVwapPct: 0.006,
   maxPositionNotionalPct: 0.2,
 
   sessionStartHour: 10,
-  sessionEndHour: 18.75
+  sessionEndHour: 18.75,
+
+  sessionTimezone: 'UTC',
+  contractMultiplier: 1
 };
 
-function padSeries(values: number[], totalLength: number): Array<number | null> {
-  const missing = totalLength - values.length;
+function isFinitePositive(value: number | null | undefined): value is number {
+  return value !== null && value !== undefined && Number.isFinite(value) && value > 0;
+}
+
+function validateCandle(candle: Candle): boolean {
+  return (
+    Number.isFinite(candle.time) &&
+    Number.isFinite(candle.open) &&
+    Number.isFinite(candle.high) &&
+    Number.isFinite(candle.low) &&
+    Number.isFinite(candle.close) &&
+    Number.isFinite(candle.volume) &&
+    candle.open > 0 &&
+    candle.high >= candle.low &&
+    candle.high >= candle.open &&
+    candle.high >= candle.close &&
+    candle.low <= candle.open &&
+    candle.low <= candle.close &&
+    candle.volume >= 0
+  );
+}
+
+function validateCandles(candles: Candle[]): boolean {
+  for (let i = 0; i < candles.length; i++) {
+    if (!validateCandle(candles[i])) return false;
+
+    if (i > 0 && candles[i].time <= candles[i - 1].time) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function padSeries(
+  values: number[],
+  totalLength: number
+): Array<number | null> {
+  const missing = Math.max(0, totalLength - values.length);
   const result: Array<number | null> = [];
 
   for (let i = 0; i < missing; i++) {
     result.push(null);
   }
 
-  for (const v of values) {
-    result.push(v);
+  for (const value of values) {
+    result.push(value);
+  }
+
+  return result;
+}
+
+function alignDerivedSeries(
+  values: number[],
+  firstIndex: number,
+  totalLength: number
+): Array<number | null> {
+  const result: Array<number | null> = Array(totalLength).fill(null);
+
+  for (let i = 0; i < values.length; i++) {
+    const index = firstIndex + i;
+
+    if (index >= 0 && index < totalLength) {
+      result[index] = values[i];
+    }
   }
 
   return result;
 }
 
 function mergeBucket(bucket: Candle[], bucketStart: number): Candle {
-  const open = bucket[0].open;
-  const close = bucket[bucket.length - 1].close;
-  let high = bucket[0].high;
-  let low = bucket[0].low;
+  const first = bucket[0];
+  const last = bucket[bucket.length - 1];
+
+  let high = first.high;
+  let low = first.low;
   let volume = 0;
 
-  for (const c of bucket) {
-    if (c.high > high) high = c.high;
-    if (c.low < low) low = c.low;
-    volume += c.volume;
+  for (const candle of bucket) {
+    if (candle.high > high) high = candle.high;
+    if (candle.low < low) low = candle.low;
+
+    volume += candle.volume;
   }
 
   return {
     time: bucketStart,
-    open,
+    open: first.open,
     high,
     low,
-    close,
+    close: last.close,
     volume
   };
 }
 
-export function aggregateCandlesTo5m(candles: Candle[]): Candle[] {
+function isComplete5mBucket(
+  bucket: Candle[],
+  bucketStart: number
+): boolean {
+  if (bucket.length !== 5) return false;
+
+  for (let i = 0; i < 5; i++) {
+    const expectedTime = bucketStart + i * 60 * 1000;
+
+    if (bucket[i].time !== expectedTime) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+export function aggregateCandlesTo5m(
+  candles: Candle[],
+  dropIncompleteBuckets = true
+): Candle[] {
   const result: Candle[] = [];
+
   if (candles.length === 0) return result;
+  if (!validateCandles(candles)) return result;
 
   let bucket: Candle[] = [];
   let currentBucketStart: number | null = null;
 
-  for (const candle of candles) {
-    const bucketStart = Math.floor(candle.time / (5 * 60 * 1000)) * (5 * 60 * 1000);
+  const flushBucket = (): void => {
+    if (
+      bucket.length > 0 &&
+      currentBucketStart !== null &&
+      (!dropIncompleteBuckets ||
+        isComplete5mBucket(bucket, currentBucketStart))
+    ) {
+      result.push(mergeBucket(bucket, currentBucketStart));
+    }
+  };
 
-    if (currentBucketStart === null || bucketStart !== currentBucketStart) {
-      if (bucket.length > 0 && currentBucketStart !== null) {
-        result.push(mergeBucket(bucket, currentBucketStart));
-      }
+  for (const candle of candles) {
+    const bucketStart =
+      Math.floor(candle.time / (5 * 60 * 1000)) *
+      (5 * 60 * 1000);
+
+    if (
+      currentBucketStart === null ||
+      bucketStart !== currentBucketStart
+    ) {
+      flushBucket();
 
       bucket = [candle];
       currentBucketStart = bucketStart;
@@ -195,9 +329,7 @@ export function aggregateCandlesTo5m(candles: Candle[]): Candle[] {
     }
   }
 
-  if (bucket.length > 0 && currentBucketStart !== null) {
-    result.push(mergeBucket(bucket, currentBucketStart));
-  }
+  flushBucket();
 
   return result;
 }
@@ -206,6 +338,14 @@ export function build1mIndicators(
   candles: Candle[],
   params: ScalpParams = DEFAULT_SCALP_PARAMS
 ): BarIndicators1m[] {
+  if (!validateCandles(candles)) {
+    return candles.map(() => ({
+      atr1m: null,
+      vwap1m: null,
+      volumeSma1m: null
+    }));
+  }
+
   const atrRaw = ATR.calculate({
     high: candles.map(c => c.high),
     low: candles.map(c => c.low),
@@ -219,24 +359,37 @@ export function build1mIndicators(
   });
 
   const atrSeries = padSeries(atrRaw, candles.length);
-  const volumeSmaSeries = padSeries(volumeSmaRaw, candles.length);
+  const volumeSmaSeries = padSeries(
+    volumeSmaRaw,
+    candles.length
+  );
+
+  const typicalPrices = candles.map(
+    candle => (candle.high + candle.low + candle.close) / 3
+  );
+
   const indicators: BarIndicators1m[] = [];
 
-  const typicalPrices = candles.map(c => (c.high + c.low + c.close) / 3);
-
   for (let i = 0; i < candles.length; i++) {
-    const start = Math.max(0, i - params.vwapPeriod1m + 1);
-    let pv = 0;
-    let vv = 0;
+    const start = Math.max(
+      0,
+      i - params.vwapPeriod1m + 1
+    );
+
+    let priceVolume = 0;
+    let totalVolume = 0;
 
     for (let j = start; j <= i; j++) {
-      pv += typicalPrices[j] * candles[j].volume;
-      vv += candles[j].volume;
+      priceVolume += typicalPrices[j] * candles[j].volume;
+      totalVolume += candles[j].volume;
     }
 
     indicators.push({
       atr1m: atrSeries[i],
-      vwap1m: vv > 0 ? pv / vv : null,
+      vwap1m:
+        totalVolume > 0
+          ? priceVolume / totalVolume
+          : null,
       volumeSma1m: volumeSmaSeries[i]
     });
   }
@@ -248,6 +401,16 @@ export function build5mIndicators(
   candles5m: Candle[],
   params: ScalpParams = DEFAULT_SCALP_PARAMS
 ): BarIndicators5m[] {
+  if (!validateCandles(candles5m)) {
+    return candles5m.map(() => ({
+      atr5m: null,
+      atr5mSma: null,
+      emaFast5m: null,
+      emaSlow5m: null,
+      close5m: null
+    }));
+  }
+
   const closes = candles5m.map(c => c.close);
 
   const atrRaw = ATR.calculate({
@@ -272,129 +435,598 @@ export function build5mIndicators(
     values: closes
   });
 
-  const atrSeries = padSeries(atrRaw, candles5m.length);
-  const emaFastSeries = padSeries(emaFastRaw, candles5m.length);
-  const emaSlowSeries = padSeries(emaSlowRaw, candles5m.length);
+  const atrSeries = padSeries(
+    atrRaw,
+    candles5m.length
+  );
 
-  const atrSmaSeriesRaw = padSeries(atrSmaRaw, atrRaw.length);
-  const atrSmaSeries: Array<number | null> = [];
-  const atrMissing = candles5m.length - atrRaw.length;
+  const emaFastSeries = padSeries(
+    emaFastRaw,
+    candles5m.length
+  );
 
-  for (let i = 0; i < atrMissing; i++) {
-    atrSmaSeries.push(null);
-  }
+  const emaSlowSeries = padSeries(
+    emaSlowRaw,
+    candles5m.length
+  );
 
-  for (const v of atrSmaSeriesRaw) {
-    atrSmaSeries.push(v);
-  }
+  const atrSmaFirstIndex =
+    params.atrPeriod5m +
+    params.trendAtrLookback5m -
+    2;
 
-  const result: BarIndicators5m[] = [];
+  const atrSmaSeries = alignDerivedSeries(
+    atrSmaRaw,
+    atrSmaFirstIndex,
+    candles5m.length
+  );
 
-  for (let i = 0; i < candles5m.length; i++) {
-    result.push({
-      atr5m: atrSeries[i],
-      atr5mSma: atrSmaSeries[i] ?? null,
-      emaFast5m: emaFastSeries[i],
-      emaSlow5m: emaSlowSeries[i],
-      close5m: candles5m[i].close
-    });
-  }
-
-  return result;
+  return candles5m.map((candle, index) => ({
+    atr5m: atrSeries[index],
+    atr5mSma: atrSmaSeries[index],
+    emaFast5m: emaFastSeries[index],
+    emaSlow5m: emaSlowSeries[index],
+    close5m: candle.close
+  }));
 }
 
-export function map1mIndexTo5mIndex(candleTime: number, candles5m: Candle[]): number {
+export function map1mIndexTo5mIndex(
+  candleTime: number,
+  candles5m: Candle[]
+): number {
   if (candles5m.length === 0) return -1;
 
-  const bucketStart = Math.floor(candleTime / (5 * 60 * 1000)) * (5 * 60 * 1000);
+  const bucketStart =
+    Math.floor(candleTime / (5 * 60 * 1000)) *
+    (5 * 60 * 1000);
 
   let left = 0;
   let right = candles5m.length - 1;
-  let ans = -1;
+  let answer = -1;
 
   while (left <= right) {
-    const mid = Math.floor((left + right) / 2);
+    const middle = Math.floor((left + right) / 2);
 
-    if (candles5m[mid].time <= bucketStart) {
-      ans = mid;
-      left = mid + 1;
+    if (candles5m[middle].time <= bucketStart) {
+      answer = middle;
+      left = middle + 1;
     } else {
-      right = mid - 1;
+      right = middle - 1;
     }
   }
 
-  return ans;
+  return answer;
 }
 
-function getHourFraction(time: number): number {
-  const d = new Date(time);
-  return d.getUTCHours() + d.getUTCMinutes() / 60;
+export function map1mIndexToClosed5mIndex(
+  candleTime: number,
+  candles5m: Candle[]
+): number {
+  if (candles5m.length === 0) return -1;
+
+  const currentBucketStart =
+    Math.floor(candleTime / (5 * 60 * 1000)) *
+    (5 * 60 * 1000);
+
+  const lastClosedBucketStart =
+    currentBucketStart - 5 * 60 * 1000;
+
+  let left = 0;
+  let right = candles5m.length - 1;
+  let answer = -1;
+
+  while (left <= right) {
+    const middle = Math.floor((left + right) / 2);
+
+    if (
+      candles5m[middle].time <= lastClosedBucketStart
+    ) {
+      answer = middle;
+      left = middle + 1;
+    } else {
+      right = middle - 1;
+    }
+  }
+
+  return answer;
 }
 
-function inSession(time: number, params: ScalpParams): boolean {
-  const hour = getHourFraction(time);
-  return hour >= params.sessionStartHour && hour <= params.sessionEndHour;
+function getHourFractionUtc(time: number): number {
+  const date = new Date(time);
+
+  return (
+    date.getUTCHours() +
+    date.getUTCMinutes() / 60 +
+    date.getUTCSeconds() / 3600
+  );
+}
+
+function inSession(
+  time: number,
+  params: ScalpParams
+): boolean {
+  const hour = getHourFractionUtc(time);
+
+  return (
+    hour >= params.sessionStartHour &&
+    hour <= params.sessionEndHour
+  );
 }
 
 function calcBodyPct(candle: Candle): number {
-  if (candle.open === 0) return 0;
+  if (candle.open <= 0) return 0;
+
   return Math.abs(candle.close - candle.open) / candle.open;
 }
 
-function calcVolumeRatio(candle: Candle, ind1m: BarIndicators1m): number {
-  if (!ind1m.volumeSma1m || ind1m.volumeSma1m <= 0) return 0;
-  return candle.volume / ind1m.volumeSma1m;
+function calcCloseLocation(candle: Candle): number {
+  const range = candle.high - candle.low;
+
+  if (range <= 0) return 0.5;
+
+  return (candle.close - candle.low) / range;
+}
+
+function calcVolumeRatio(
+  candle: Candle,
+  indicators: BarIndicators1m
+): number {
+  if (
+    indicators.volumeSma1m === null ||
+    indicators.volumeSma1m <= 0
+  ) {
+    return 0;
+  }
+
+  return candle.volume / indicators.volumeSma1m;
 }
 
 function calcDistancePct(a: number, b: number): number {
   if (b === 0) return 0;
-  return Math.abs(a - b) / b;
+
+  return Math.abs(a - b) / Math.abs(b);
 }
 
-function highestHigh(candles: Candle[], from: number, to: number): number {
-  let h = -Infinity;
+function highestHigh(
+  candles: Candle[],
+  from: number,
+  to: number
+): number {
+  if (from > to) return -Infinity;
 
-  for (let i = from; i <= to; i++) {
-    if (candles[i].high > h) h = candles[i].high;
+  let high = -Infinity;
+
+  for (
+    let index = Math.max(0, from);
+    index <= Math.min(to, candles.length - 1);
+    index++
+  ) {
+    if (candles[index].high > high) {
+      high = candles[index].high;
+    }
   }
 
-  return h;
+  return high;
 }
 
-function lowestLow(candles: Candle[], from: number, to: number): number {
-  let l = Infinity;
+function lowestLow(
+  candles: Candle[],
+  from: number,
+  to: number
+): number {
+  if (from > to) return Infinity;
 
-  for (let i = from; i <= to; i++) {
-    if (candles[i].low < l) l = candles[i].low;
+  let low = Infinity;
+
+  for (
+    let index = Math.max(0, from);
+    index <= Math.min(to, candles.length - 1);
+    index++
+  ) {
+    if (candles[index].low < low) {
+      low = candles[index].low;
+    }
   }
 
-  return l;
+  return low;
 }
 
-function detectPullbackLong(candles: Candle[], index: number, lookback: number): number | null {
+function detectPullbackLong(
+  candles: Candle[],
+  index: number,
+  lookback: number
+): number | null {
   const from = index - lookback;
-  if (from < 1) return null;
 
-  const recentHigh = highestHigh(candles, from, index - 1);
-  const recentLow = lowestLow(candles, from, index - 1);
+  if (from < 1 || index - 1 < from) {
+    return null;
+  }
 
-  if (recentHigh <= 0) return null;
-  return (recentHigh - recentLow) / recentHigh;
+  const recentHigh = highestHigh(
+    candles,
+    from,
+    index - 1
+  );
+
+  const previousClose = candles[index - 1].close;
+
+  if (!Number.isFinite(recentHigh) || recentHigh <= 0) {
+    return null;
+  }
+
+  const pullbackPct =
+    (recentHigh - previousClose) / recentHigh;
+
+  return Math.max(0, pullbackPct);
 }
 
-function detectPullbackShort(candles: Candle[], index: number, lookback: number): number | null {
+function detectPullbackShort(
+  candles: Candle[],
+  index: number,
+  lookback: number
+): number | null {
   const from = index - lookback;
-  if (from < 1) return null;
 
-  const recentHigh = highestHigh(candles, from, index - 1);
-  const recentLow = lowestLow(candles, from, index - 1);
+  if (from < 1 || index - 1 < from) {
+    return null;
+  }
 
-  if (recentLow <= 0) return null;
-  return (recentHigh - recentLow) / recentLow;
+  const recentLow = lowestLow(
+    candles,
+    from,
+    index - 1
+  );
+
+  const previousClose = candles[index - 1].close;
+
+  if (!Number.isFinite(recentLow) || recentLow <= 0) {
+    return null;
+  }
+
+  const pullbackPct =
+    (previousClose - recentLow) / recentLow;
+
+  return Math.max(0, pullbackPct);
 }
 
-export function floorToStep(value: number, step: number): number {
+function assertValidParams(params: ScalpParams): void {
+  const positiveValues = [
+    params.atrPeriod1m,
+    params.atrPeriod5m,
+    params.emaFastPeriod5m,
+    params.emaSlowPeriod5m,
+    params.vwapPeriod1m,
+    params.volumeLookback1m,
+    params.trendAtrLookback5m,
+    params.pullbackLookback1m,
+    params.atrSlMult,
+    params.atrTpMult
+  ];
+
+  if (
+    positiveValues.some(
+      value => !Number.isFinite(value) || value <= 0
+    )
+  ) {
+    throw new Error(
+      'Scalp parameters must contain positive periods and multipliers'
+    );
+  }
+
+  if (
+    params.riskPerTrade < 0 ||
+    params.maxRiskPerTrade < 0 ||
+    params.commissionRate < 0 ||
+    params.slippageRate < 0 ||
+    params.maxPositionNotionalPct <= 0
+  ) {
+    throw new Error(
+      'Risk, cost and position parameters are invalid'
+    );
+  }
+
+  if (
+    params.minCloseLocationLong < 0 ||
+    params.minCloseLocationLong > 1 ||
+    params.maxCloseLocationShort < 0 ||
+    params.maxCloseLocationShort > 1
+  ) {
+    throw new Error(
+      'Close-location parameters must be between 0 and 1'
+    );
+  }
+}
+
+export function floorToStep(
+  value: number,
+  step: number
+): number {
+  if (!Number.isFinite(value) || !Number.isFinite(step)) {
+    return 0;
+  }
+
+  if (step <= 0) return value;
+
   return Math.floor(value / step) * step;
+}
+
+export function calculatePositionSize(
+  input: PositionSizeInput
+): number {
+  const {
+    equity,
+    entryPrice,
+    stopPrice,
+    riskPerTrade,
+    maxRiskPerTrade,
+    maxPositionNotionalPct,
+    contractMultiplier = 1
+  } = input;
+
+  if (
+    !Number.isFinite(equity) ||
+    equity <= 0 ||
+    !Number.isFinite(entryPrice) ||
+    entryPrice <= 0 ||
+    !Number.isFinite(stopPrice) ||
+    stopPrice <= 0 ||
+    contractMultiplier <= 0
+  ) {
+    return 0;
+  }
+
+  const riskBudget =
+    equity *
+    Math.min(
+      Math.max(0, riskPerTrade),
+      Math.max(0, maxRiskPerTrade)
+    );
+
+  const riskPerUnit =
+    Math.abs(entryPrice - stopPrice) *
+    contractMultiplier;
+
+  if (riskBudget <= 0 || riskPerUnit <= 0) {
+    return 0;
+  }
+
+  const sizeByRisk = riskBudget / riskPerUnit;
+
+  const maxNotional =
+    equity * Math.max(0, maxPositionNotionalPct);
+
+  const sizeByNotional =
+    maxNotional /
+    (entryPrice * contractMultiplier);
+
+  return Math.max(
+    0,
+    Math.min(sizeByRisk, sizeByNotional)
+  );
+}
+
+function getRoundTripCostPct(
+  params: ScalpParams
+): number {
+  const commissionRoundTrip =
+    params.commissionRate * 2;
+
+  const slippageRoundTrip =
+    params.slippageRate * 2;
+
+  return commissionRoundTrip + slippageRoundTrip;
+}
+
+function hasEnoughTargetAfterCosts(
+  targetMovePct: number,
+  params: ScalpParams
+): boolean {
+  const roundTripCostPct =
+    getRoundTripCostPct(params);
+
+  const minimumByCost =
+    roundTripCostPct * params.minCostCoverage;
+
+  return (
+    targetMovePct >= params.minTargetMovePct &&
+    targetMovePct >= minimumByCost
+  );
+}
+
+function createLongSignal(
+  candles1m: Candle[],
+  indicators1m: BarIndicators1m[],
+  candles5m: Candle[],
+  indicators5m: BarIndicators5m[],
+  signalIndex: number,
+  entryIndex: number,
+  idx5m: number,
+  params: ScalpParams,
+  pullbackPct: number,
+  volumeRatio: number,
+  bodyPct: number,
+  closeLocation: number,
+  breakoutLevel: number
+): ScalpSignal | null {
+  const signalCandle = candles1m[signalIndex];
+  const entryCandle = candles1m[entryIndex];
+  const ind1m = indicators1m[signalIndex];
+  const ctx5m = indicators5m[idx5m];
+
+  if (
+    ind1m.atr1m === null ||
+    ind1m.vwap1m === null ||
+    ctx5m.atr5m === null
+  ) {
+    return null;
+  }
+
+  const rawEntryPrice = Math.max(
+    entryCandle.open,
+    breakoutLevel
+  );
+
+  const entryPrice =
+    rawEntryPrice * (1 + params.slippageRate);
+
+  const stopDistance =
+    ind1m.atr1m * params.atrSlMult;
+
+  const stopLossPrice =
+    entryPrice - stopDistance;
+
+  const takeProfitPrice =
+    entryPrice +
+    ind1m.atr1m * params.atrTpMult;
+
+  const targetMovePct =
+    (takeProfitPrice - entryPrice) /
+    entryPrice;
+
+  if (
+    !hasEnoughTargetAfterCosts(
+      targetMovePct,
+      params
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    side: 'long',
+
+    signalIndex,
+    entryIndex,
+
+    signalTime: signalCandle.time,
+    entryTime: entryCandle.time,
+
+    rawEntryPrice,
+    triggerPrice: breakoutLevel,
+    entryPrice,
+
+    stopLossPrice,
+    takeProfitPrice,
+
+    riskDistance: stopDistance,
+
+    atr1m: ind1m.atr1m,
+    atr5m: ctx5m.atr5m,
+    vwap1m: ind1m.vwap1m,
+
+    impulseBodyPct: bodyPct,
+    closeLocation,
+    pullbackPct,
+    volumeRatio,
+
+    entryCommissionPct: params.commissionRate,
+    estimatedExitCommissionPct: params.commissionRate,
+    estimatedRoundTripSlippagePct:
+      params.slippageRate * 2,
+    estimatedRoundTripCostPct:
+      getRoundTripCostPct(params),
+    expectedNetTargetMovePct:
+      targetMovePct -
+      getRoundTripCostPct(params)
+  };
+}
+
+function createShortSignal(
+  candles1m: Candle[],
+  indicators1m: BarIndicators1m[],
+  candles5m: Candle[],
+  indicators5m: BarIndicators5m[],
+  signalIndex: number,
+  entryIndex: number,
+  idx5m: number,
+  params: ScalpParams,
+  pullbackPct: number,
+  volumeRatio: number,
+  bodyPct: number,
+  closeLocation: number,
+  breakoutLevel: number
+): ScalpSignal | null {
+  const signalCandle = candles1m[signalIndex];
+  const entryCandle = candles1m[entryIndex];
+  const ind1m = indicators1m[signalIndex];
+  const ctx5m = indicators5m[idx5m];
+
+  if (
+    ind1m.atr1m === null ||
+    ind1m.vwap1m === null ||
+    ctx5m.atr5m === null
+  ) {
+    return null;
+  }
+
+  const rawEntryPrice = Math.min(
+    entryCandle.open,
+    breakoutLevel
+  );
+
+  const entryPrice =
+    rawEntryPrice * (1 - params.slippageRate);
+
+  const stopDistance =
+    ind1m.atr1m * params.atrSlMult;
+
+  const stopLossPrice =
+    entryPrice + stopDistance;
+
+  const takeProfitPrice =
+    entryPrice -
+    ind1m.atr1m * params.atrTpMult;
+
+  const targetMovePct =
+    (entryPrice - takeProfitPrice) /
+    entryPrice;
+
+  if (
+    !hasEnoughTargetAfterCosts(
+      targetMovePct,
+      params
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    side: 'short',
+
+    signalIndex,
+    entryIndex,
+
+    signalTime: signalCandle.time,
+    entryTime: entryCandle.time,
+
+    rawEntryPrice,
+    triggerPrice: breakoutLevel,
+    entryPrice,
+
+    stopLossPrice,
+    takeProfitPrice,
+
+    riskDistance: stopDistance,
+
+    atr1m: ind1m.atr1m,
+    atr5m: ctx5m.atr5m,
+    vwap1m: ind1m.vwap1m,
+
+    impulseBodyPct: bodyPct,
+    closeLocation,
+    pullbackPct,
+    volumeRatio,
+
+    entryCommissionPct: params.commissionRate,
+    estimatedExitCommissionPct: params.commissionRate,
+    estimatedRoundTripSlippagePct:
+      params.slippageRate * 2,
+    estimatedRoundTripCostPct:
+      getRoundTripCostPct(params),
+    expectedNetTargetMovePct:
+      targetMovePct -
+      getRoundTripCostPct(params)
+  };
 }
 
 export function evaluateMomentumScalpEntry(
@@ -405,185 +1037,346 @@ export function evaluateMomentumScalpEntry(
   signalIndex: number,
   params: ScalpParams = DEFAULT_SCALP_PARAMS
 ): EntryDecision {
-  if (signalIndex < 2 || signalIndex + 1 >= candles1m.length) {
-    return { accepted: false, reason: 'not_enough_history' };
+  assertValidParams(params);
+
+  if (
+    !validateCandles(candles1m) ||
+    !validateCandles(candles5m)
+  ) {
+    return {
+      accepted: false,
+      reason: 'invalid_data'
+    };
+  }
+
+  if (
+    signalIndex < 2 ||
+    signalIndex + 1 >= candles1m.length ||
+    signalIndex >= indicators1m.length
+  ) {
+    return {
+      accepted: false,
+      reason: 'not_enough_history'
+    };
   }
 
   const signalCandle = candles1m[signalIndex];
   const entryCandle = candles1m[signalIndex + 1];
   const ind1m = indicators1m[signalIndex];
 
-  if (!inSession(signalCandle.time, params)) {
-    return { accepted: false, reason: 'outside_session' };
+  if (
+    !inSession(signalCandle.time, params) ||
+    !inSession(entryCandle.time, params)
+  ) {
+    return {
+      accepted: false,
+      reason: 'outside_session'
+    };
   }
 
-  if (!ind1m.atr1m || !ind1m.vwap1m || !ind1m.volumeSma1m) {
-    return { accepted: false, reason: 'missing_context' };
+  if (
+    !isFinitePositive(ind1m.atr1m) ||
+    !isFinitePositive(ind1m.vwap1m) ||
+    !isFinitePositive(ind1m.volumeSma1m)
+  ) {
+    return {
+      accepted: false,
+      reason: 'missing_context'
+    };
   }
 
-  const idx5m = map1mIndexTo5mIndex(signalCandle.time, candles5m);
-  if (idx5m < 1 || idx5m >= indicators5m.length) {
-    return { accepted: false, reason: 'missing_context' };
+  const idx5m = map1mIndexToClosed5mIndex(
+    signalCandle.time,
+    candles5m
+  );
+
+  if (
+    idx5m < 1 ||
+    idx5m >= indicators5m.length
+  ) {
+    return {
+      accepted: false,
+      reason: 'missing_context'
+    };
   }
 
   const ctx5m = indicators5m[idx5m];
+  const previousCtx5m = indicators5m[idx5m - 1];
+
   if (
-    !ctx5m.atr5m ||
-    !ctx5m.atr5mSma ||
-    !ctx5m.emaFast5m ||
-    !ctx5m.emaSlow5m ||
-    !ctx5m.close5m
+    !isFinitePositive(ctx5m.atr5m) ||
+    !isFinitePositive(ctx5m.atr5mSma) ||
+    !isFinitePositive(ctx5m.emaFast5m) ||
+    !isFinitePositive(ctx5m.emaSlow5m) ||
+    !isFinitePositive(ctx5m.close5m)
   ) {
-    return { accepted: false, reason: 'missing_context' };
+    return {
+      accepted: false,
+      reason: 'missing_context'
+    };
   }
 
-  if (ctx5m.atr5m < ctx5m.atr5mSma * params.trendAtrExpandRatio5m) {
-    return { accepted: false, reason: 'atr_not_expanding' };
+  const atrExpanding =
+    ctx5m.atr5m >=
+      ctx5m.atr5mSma *
+        params.trendAtrExpandRatio5m &&
+    (
+      previousCtx5m?.atr5m === null ||
+      previousCtx5m?.atr5m === undefined ||
+      ctx5m.atr5m >= previousCtx5m.atr5m
+    );
+
+  if (!atrExpanding) {
+    return {
+      accepted: false,
+      reason: 'atr_not_expanding'
+    };
   }
 
-  const volumeRatio = calcVolumeRatio(signalCandle, ind1m);
-  if (volumeRatio < params.volumeMinRatio1m) {
-    return { accepted: false, reason: 'volume_too_small' };
+  const volumeRatio = calcVolumeRatio(
+    signalCandle,
+    ind1m
+  );
+
+  if (
+    !Number.isFinite(volumeRatio) ||
+    volumeRatio < params.volumeMinRatio1m
+  ) {
+    return {
+      accepted: false,
+      reason: 'volume_too_small'
+    };
   }
 
   const bodyPct = calcBodyPct(signalCandle);
-  if (bodyPct < params.minImpulseBodyPct) {
-    return { accepted: false, reason: 'impulse_too_small' };
+
+  if (
+    !Number.isFinite(bodyPct) ||
+    bodyPct < params.minImpulseBodyPct
+  ) {
+    return {
+      accepted: false,
+      reason: 'impulse_too_small'
+    };
   }
 
-  const vwapDistancePct = calcDistancePct(signalCandle.close, ind1m.vwap1m);
-  if (vwapDistancePct > params.maxEntryDistanceFromVwapPct) {
-    return { accepted: false, reason: 'too_far_from_vwap' };
+  const closeLocation =
+    calcCloseLocation(signalCandle);
+
+  const vwapDistancePct = calcDistancePct(
+    signalCandle.close,
+    ind1m.vwap1m
+  );
+
+  if (
+    vwapDistancePct >
+    params.maxEntryDistanceFromVwapPct
+  ) {
+    return {
+      accepted: false,
+      reason: 'too_far_from_vwap'
+    };
   }
 
   const is5mLongTrend =
-    ctx5m.emaFast5m > ctx5m.emaSlow5m && ctx5m.close5m > ctx5m.emaFast5m;
+    ctx5m.emaFast5m > ctx5m.emaSlow5m &&
+    ctx5m.close5m > ctx5m.emaFast5m;
+
   const is5mShortTrend =
-    ctx5m.emaFast5m < ctx5m.emaSlow5m && ctx5m.close5m < ctx5m.emaFast5m;
+    ctx5m.emaFast5m < ctx5m.emaSlow5m &&
+    ctx5m.close5m < ctx5m.emaFast5m;
+
+  if (
+    is5mLongTrend === is5mShortTrend
+  ) {
+    return {
+      accepted: false,
+      reason: 'trend_not_aligned'
+    };
+  }
 
   const recentHigh = highestHigh(
     candles1m,
-    Math.max(0, signalIndex - params.pullbackLookback1m),
+    signalIndex - params.pullbackLookback1m,
     signalIndex - 1
   );
+
   const recentLow = lowestLow(
     candles1m,
-    Math.max(0, signalIndex - params.pullbackLookback1m),
+    signalIndex - params.pullbackLookback1m,
     signalIndex - 1
   );
 
-  const longPullbackPct = detectPullbackLong(
-    candles1m,
-    signalIndex,
-    params.pullbackLookback1m
-  );
-  const shortPullbackPct = detectPullbackShort(
-    candles1m,
-    signalIndex,
-    params.pullbackLookback1m
-  );
-
-  const longBreakoutLevel = recentHigh * (1 + params.breakoutBufferPct);
-  const shortBreakoutLevel = recentLow * (1 - params.breakoutBufferPct);
-
-  const longBreakout = entryCandle.high >= longBreakoutLevel;
-  const shortBreakout = entryCandle.low <= shortBreakoutLevel;
-
-  if (!is5mLongTrend && !is5mShortTrend) {
-    return { accepted: false, reason: 'trend_not_aligned' };
+  if (
+    !Number.isFinite(recentHigh) ||
+    !Number.isFinite(recentLow) ||
+    recentHigh <= 0 ||
+    recentLow <= 0
+  ) {
+    return {
+      accepted: false,
+      reason: 'missing_context'
+    };
   }
 
-  if (is5mLongTrend && !is5mShortTrend) {
-    if (longPullbackPct === null || longPullbackPct < params.minPullbackPct) {
-      return { accepted: false, reason: 'pullback_too_small' };
+  const longPullbackPct =
+    detectPullbackLong(
+      candles1m,
+      signalIndex,
+      params.pullbackLookback1m
+    );
+
+  const shortPullbackPct =
+    detectPullbackShort(
+      candles1m,
+      signalIndex,
+      params.pullbackLookback1m
+    );
+
+  const longBreakoutLevel =
+    recentHigh *
+    (1 + params.breakoutBufferPct);
+
+  const shortBreakoutLevel =
+    recentLow *
+    (1 - params.breakoutBufferPct);
+
+  if (is5mLongTrend) {
+    const bullishImpulse =
+      signalCandle.close >
+      signalCandle.open;
+
+    if (
+      !bullishImpulse ||
+      closeLocation <
+        params.minCloseLocationLong
+    ) {
+      return {
+        accepted: false,
+        reason: 'impulse_too_small'
+      };
     }
+
+    if (
+      longPullbackPct === null ||
+      longPullbackPct <
+        params.minPullbackPct
+    ) {
+      return {
+        accepted: false,
+        reason: 'pullback_too_small'
+      };
+    }
+
+    const longBreakout =
+      entryCandle.high >=
+      longBreakoutLevel;
 
     if (!longBreakout) {
-      return { accepted: false, reason: 'breakout_missing' };
+      return {
+        accepted: false,
+        reason: 'breakout_missing'
+      };
     }
 
-    const entryPrice =
-      Math.max(entryCandle.open, longBreakoutLevel) * (1 + params.slippageRate);
-    const stopDistance = ind1m.atr1m * params.atrSlMult;
-    const stopLossPrice = entryPrice - stopDistance;
-    const takeProfitPrice = entryPrice + ind1m.atr1m * params.atrTpMult;
-    const targetMovePct = (takeProfitPrice - entryPrice) / entryPrice;
-    const costPct = params.commissionRate * 2 + params.slippageRate * 2;
+    const signal = createLongSignal(
+      candles1m,
+      indicators1m,
+      candles5m,
+      indicators5m,
+      signalIndex,
+      signalIndex + 1,
+      idx5m,
+      params,
+      longPullbackPct,
+      volumeRatio,
+      bodyPct,
+      closeLocation,
+      longBreakoutLevel
+    );
 
-    if (
-      targetMovePct < params.minTargetMovePct ||
-      targetMovePct < costPct * params.minCostCoverage
-    ) {
-      return { accepted: false, reason: 'target_too_small_for_costs' };
+    if (!signal) {
+      return {
+        accepted: false,
+        reason: 'target_too_small_for_costs'
+      };
     }
 
     return {
       accepted: true,
-      signal: {
-        side: 'long',
-        signalIndex,
-        entryIndex: signalIndex + 1,
-        signalTime: signalCandle.time,
-        entryTime: entryCandle.time,
-        entryPrice,
-        stopLossPrice,
-        takeProfitPrice,
-        riskDistance: stopDistance,
-        atr1m: ind1m.atr1m,
-        atr5m: ctx5m.atr5m,
-        vwap1m: ind1m.vwap1m,
-        impulseBodyPct: bodyPct,
-        pullbackPct: longPullbackPct,
-        volumeRatio
-      }
+      signal
     };
   }
 
-  if (is5mShortTrend && !is5mLongTrend) {
-    if (shortPullbackPct === null || shortPullbackPct < params.minPullbackPct) {
-      return { accepted: false, reason: 'pullback_too_small' };
+  if (is5mShortTrend) {
+    const bearishImpulse =
+      signalCandle.close <
+      signalCandle.open;
+
+    if (
+      !bearishImpulse ||
+      closeLocation >
+        params.maxCloseLocationShort
+    ) {
+      return {
+        accepted: false,
+        reason: 'impulse_too_small'
+      };
     }
+
+    if (
+      shortPullbackPct === null ||
+      shortPullbackPct <
+        params.minPullbackPct
+    ) {
+      return {
+        accepted: false,
+        reason: 'pullback_too_small'
+      };
+    }
+
+    const shortBreakout =
+      entryCandle.low <=
+      shortBreakoutLevel;
 
     if (!shortBreakout) {
-      return { accepted: false, reason: 'breakout_missing' };
+      return {
+        accepted: false,
+        reason: 'breakout_missing'
+      };
     }
 
-    const entryPrice =
-      Math.min(entryCandle.open, shortBreakoutLevel) * (1 - params.slippageRate);
-    const stopDistance = ind1m.atr1m * params.atrSlMult;
-    const stopLossPrice = entryPrice + stopDistance;
-    const takeProfitPrice = entryPrice - ind1m.atr1m * params.atrTpMult;
-    const targetMovePct = (entryPrice - takeProfitPrice) / entryPrice;
-    const costPct = params.commissionRate * 2 + params.slippageRate * 2;
+    const signal = createShortSignal(
+      candles1m,
+      indicators1m,
+      candles5m,
+      indicators5m,
+      signalIndex,
+      signalIndex + 1,
+      idx5m,
+      params,
+      shortPullbackPct,
+      volumeRatio,
+      bodyPct,
+      closeLocation,
+      shortBreakoutLevel
+    );
 
-    if (
-      targetMovePct < params.minTargetMovePct ||
-      targetMovePct < costPct * params.minCostCoverage
-    ) {
-      return { accepted: false, reason: 'target_too_small_for_costs' };
+    if (!signal) {
+      return {
+        accepted: false,
+        reason: 'target_too_small_for_costs'
+      };
     }
 
     return {
       accepted: true,
-      signal: {
-        side: 'short',
-        signalIndex,
-        entryIndex: signalIndex + 1,
-        signalTime: signalCandle.time,
-        entryTime: entryCandle.time,
-        entryPrice,
-        stopLossPrice,
-        takeProfitPrice,
-        riskDistance: stopDistance,
-        atr1m: ind1m.atr1m,
-        atr5m: ctx5m.atr5m,
-        vwap1m: ind1m.vwap1m,
-        impulseBodyPct: bodyPct,
-        pullbackPct: shortPullbackPct,
-        volumeRatio
-      }
+      signal
     };
   }
 
-  return { accepted: false, reason: 'no_signal' };
+  return {
+    accepted: false,
+    reason: 'no_signal'
+  };
 }
