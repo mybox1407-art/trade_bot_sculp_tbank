@@ -9,6 +9,13 @@ export interface Candle {
 
 export type ScalpSide = "long" | "short";
 
+export type TradingMode = "paper" | "live";
+
+export type PositionStatus =
+  | "open"
+  | "closed"
+  | "stopped";
+
 export type EntryRejectReason =
   | "outside_session"
   | "not_enough_history"
@@ -21,54 +28,84 @@ export type EntryRejectReason =
   | "impulse_too_small"
   | "target_too_small_for_costs"
   | "too_far_from_vwap"
+  | "invalid_data"
   | "no_signal";
 
 export interface ScalpParams {
   riskPerTrade: number;
   maxRiskPerTrade: number;
+
   commissionRate: number;
   slippageRate: number;
+
   atrPeriod1m: number;
   atrPeriod5m: number;
   emaFastPeriod5m: number;
   emaSlowPeriod5m: number;
   vwapPeriod1m: number;
   volumeLookback1m: number;
+
   trendAtrLookback5m: number;
   trendAtrExpandRatio5m: number;
+
   pullbackLookback1m: number;
   breakoutBufferPct: number;
   minPullbackPct: number;
   minImpulseBodyPct: number;
   volumeMinRatio1m: number;
+
+  minCloseLocationLong?: number;
+  maxCloseLocationShort?: number;
+
   atrSlMult: number;
   atrTpMult: number;
   timeStopBars: number;
   cooldownBars: number;
+
   minTargetMovePct: number;
   minCostCoverage: number;
   maxEntryDistanceFromVwapPct: number;
   maxPositionNotionalPct: number;
+
   sessionStartHour: number;
   sessionEndHour: number;
+
+  sessionTimezone?: "UTC";
+  contractMultiplier?: number;
 }
 
 export interface ScalpSignal {
   side: ScalpSide;
+
   signalIndex: number;
   entryIndex: number;
+
   signalTime: number;
   entryTime: number;
+
+  rawEntryPrice?: number;
+  triggerPrice?: number;
   entryPrice: number;
+
   stopLossPrice: number;
   takeProfitPrice: number;
+
   riskDistance: number;
+
   atr1m: number;
   atr5m: number;
   vwap1m: number;
+
   impulseBodyPct: number;
+  closeLocation?: number;
   pullbackPct: number;
   volumeRatio: number;
+
+  entryCommissionPct?: number;
+  estimatedExitCommissionPct?: number;
+  estimatedRoundTripSlippagePct?: number;
+  estimatedRoundTripCostPct?: number;
+  expectedNetTargetMovePct?: number;
 }
 
 export interface EntryDecision {
@@ -95,16 +132,52 @@ export interface Position {
   id: string;
   symbol: string;
   side: ScalpSide;
+
   entryPrice: number;
   stopLossPrice: number;
   takeProfitPrice: number;
+
   quantity: number;
+  notional: number;
+
   entryTime: number;
-  status: "open" | "closed" | "stopped";
+  status: PositionStatus;
+
+  commissionOpen: number;
+  commissionClose?: number;
+  slippageOpen?: number;
+  slippageClose?: number;
+
   closePrice?: number;
   closeTime?: number;
+
+  grossPnl?: number;
   pnl?: number;
+
+  closeReason?:
+    | "take_profit_hit"
+    | "stop_loss_hit"
+    | "time_exit"
+    | "manual"
+    | "error";
+
   signal?: ScalpSignal;
+}
+
+export interface AccountState {
+  initialBalance: number;
+  cashBalance: number;
+  realizedPnl: number;
+  totalCommissions: number;
+  updatedAt: number;
+}
+
+export interface BotState {
+  account: AccountState;
+  positions: Position[];
+  lastSignalBySymbol: Record<string, number>;
+  lastProcessedCandleBySymbol: Record<string, number>;
+  updatedAt: number;
 }
 
 export interface SignalResponse {
@@ -122,24 +195,23 @@ export interface SignalResponse {
   timestamp: number;
 }
 
-export interface PositionResponse {
-  symbol: string;
-  positions: Position[];
-  totalPnl: number;
-  timestamp: number;
-}
-
 export interface OpenPositionRequest {
   symbol: string;
   side: ScalpSide;
   quantity: number;
+  entryPrice: number;
   stopLossPrice: number;
   takeProfitPrice: number;
+  signal?: ScalpSignal;
 }
 
-export interface OpenPositionResponse {
-  success: boolean;
-  position?: Position;
-  error?: string;
-  timestamp: number;
+export interface ClosePositionRequest {
+  symbol: string;
+  closePrice: number;
+  reason?:
+    | "take_profit_hit"
+    | "stop_loss_hit"
+    | "time_exit"
+    | "manual"
+    | "error";
 }
