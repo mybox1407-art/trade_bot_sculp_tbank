@@ -1,4 +1,6 @@
-import { ATR, EMA, SMA } from 'technicalindicators';
+import { ATR, EMA, SMA } from "technicalindicators";
+import config from "../config";
+import tbankClient from "../utils/tbank";
 
 export interface Candle {
   time: number;
@@ -9,22 +11,22 @@ export interface Candle {
   volume: number;
 }
 
-export type ScalpSide = 'long' | 'short';
+export type ScalpSide = "long" | "short";
 
 export type EntryRejectReason =
-  | 'outside_session'
-  | 'not_enough_history'
-  | 'missing_context'
-  | 'trend_not_aligned'
-  | 'atr_not_expanding'
-  | 'volume_too_small'
-  | 'pullback_too_small'
-  | 'breakout_missing'
-  | 'impulse_too_small'
-  | 'target_too_small_for_costs'
-  | 'too_far_from_vwap'
-  | 'invalid_data'
-  | 'no_signal';
+  | "outside_session"
+  | "not_enough_history"
+  | "missing_context"
+  | "trend_not_aligned"
+  | "atr_not_expanding"
+  | "volume_too_small"
+  | "pullback_too_small"
+  | "breakout_missing"
+  | "impulse_too_small"
+  | "target_too_small_for_costs"
+  | "too_far_from_vwap"
+  | "invalid_data"
+  | "no_signal";
 
 export interface ScalpParams {
   riskPerTrade: number;
@@ -65,8 +67,20 @@ export interface ScalpParams {
   sessionStartHour: number;
   sessionEndHour: number;
 
-  sessionTimezone?: 'UTC';
+  sessionTimezone?: "UTC";
   contractMultiplier?: number;
+
+  /**
+   * Минимальный размер позиции.
+   * Для акций обычно 1 лот или больше.
+   */
+  minPositionSize?: number;
+
+  /**
+   * Шаг количества.
+   * Для акций может быть 1.
+   */
+  positionSizeStep?: number;
 }
 
 export interface ScalpSignal {
@@ -130,7 +144,43 @@ export interface PositionSizeInput {
   riskPerTrade: number;
   maxRiskPerTrade: number;
   maxPositionNotionalPct: number;
+  commissionRate?: number;
   contractMultiplier?: number;
+  minPositionSize?: number;
+  positionSizeStep?: number;
+}
+
+export interface RegimeResult {
+  regime:
+    | "bullish"
+    | "bearish"
+    | "flat"
+    | "not_ready"
+    | "no_data";
+  ready: boolean;
+}
+
+export interface LegacySignalResult {
+  ready: boolean;
+  buy: boolean;
+  sell: boolean;
+  side: ScalpSide | "none";
+  regime: RegimeResult["regime"];
+  positionSize?: number;
+  takeProfitPrice?: number;
+  stopLossPrice?: number;
+  signal?: ScalpSignal | null;
+  reason?: EntryRejectReason;
+  indicators?: {
+    lastRsi?: number | null;
+    lastAtr?: number | null;
+    atr1m?: number | null;
+    atr5m?: number | null;
+    vwap1m?: number | null;
+    emaFast5m?: number | null;
+    emaSlow5m?: number | null;
+    ready?: boolean;
+  };
 }
 
 export const DEFAULT_SCALP_PARAMS: ScalpParams = {
@@ -172,15 +222,38 @@ export const DEFAULT_SCALP_PARAMS: ScalpParams = {
   sessionStartHour: 10,
   sessionEndHour: 18.75,
 
-  sessionTimezone: 'UTC',
-  contractMultiplier: 1
+  sessionTimezone: "UTC",
+  contractMultiplier: 1,
+
+  minPositionSize: 1,
+  positionSizeStep: 1
 };
 
-function isFinitePositive(value: number | null | undefined): value is number {
-  return value !== null && value !== undefined && Number.isFinite(value) && value > 0;
+function isFinitePositive(
+  value: number | null | undefined
+): value is number {
+  return (
+    value !== null &&
+    value !== undefined &&
+    Number.isFinite(value) &&
+    value > 0
+  );
 }
 
-function validateCandle(candle: Candle): boolean {
+function isFiniteNonNegative(
+  value: number | null | undefined
+): value is number {
+  return (
+    value !== null &&
+    value !== undefined &&
+    Number.isFinite(value) &&
+    value >= 0
+  );
+}
+
+function validateCandle(
+  candle: Candle
+): boolean {
   return (
     Number.isFinite(candle.time) &&
     Number.isFinite(candle.open) &&
@@ -198,11 +271,18 @@ function validateCandle(candle: Candle): boolean {
   );
 }
 
-function validateCandles(candles: Candle[]): boolean {
+function validateCandles(
+  candles: Candle[]
+): boolean {
   for (let i = 0; i < candles.length; i++) {
-    if (!validateCandle(candles[i])) return false;
+    if (!validateCandle(candles[i])) {
+      return false;
+    }
 
-    if (i > 0 && candles[i].time <= candles[i - 1].time) {
+    if (
+      i > 0 &&
+      candles[i].time <= candles[i - 1].time
+    ) {
       return false;
     }
   }
@@ -214,15 +294,21 @@ function padSeries(
   values: number[],
   totalLength: number
 ): Array<number | null> {
-  const missing = Math.max(0, totalLength - values.length);
-  const result: Array<number | null> = [];
+  const result: Array<number | null> =
+    Array(totalLength).fill(null);
 
-  for (let i = 0; i < missing; i++) {
-    result.push(null);
-  }
+  const firstIndex =
+    totalLength - values.length;
 
-  for (const value of values) {
-    result.push(value);
+  for (let i = 0; i < values.length; i++) {
+    const targetIndex = firstIndex + i;
+
+    if (
+      targetIndex >= 0 &&
+      targetIndex < totalLength
+    ) {
+      result[targetIndex] = values[i];
+    }
   }
 
   return result;
@@ -233,12 +319,16 @@ function alignDerivedSeries(
   firstIndex: number,
   totalLength: number
 ): Array<number | null> {
-  const result: Array<number | null> = Array(totalLength).fill(null);
+  const result: Array<number | null> =
+    Array(totalLength).fill(null);
 
   for (let i = 0; i < values.length; i++) {
     const index = firstIndex + i;
 
-    if (index >= 0 && index < totalLength) {
+    if (
+      index >= 0 &&
+      index < totalLength
+    ) {
       result[index] = values[i];
     }
   }
@@ -246,7 +336,10 @@ function alignDerivedSeries(
   return result;
 }
 
-function mergeBucket(bucket: Candle[], bucketStart: number): Candle {
+function mergeBucket(
+  bucket: Candle[],
+  bucketStart: number
+): Candle {
   const first = bucket[0];
   const last = bucket[bucket.length - 1];
 
@@ -255,8 +348,13 @@ function mergeBucket(bucket: Candle[], bucketStart: number): Candle {
   let volume = 0;
 
   for (const candle of bucket) {
-    if (candle.high > high) high = candle.high;
-    if (candle.low < low) low = candle.low;
+    if (candle.high > high) {
+      high = candle.high;
+    }
+
+    if (candle.low < low) {
+      low = candle.low;
+    }
 
     volume += candle.volume;
   }
@@ -275,10 +373,13 @@ function isComplete5mBucket(
   bucket: Candle[],
   bucketStart: number
 ): boolean {
-  if (bucket.length !== 5) return false;
+  if (bucket.length !== 5) {
+    return false;
+  }
 
   for (let i = 0; i < 5; i++) {
-    const expectedTime = bucketStart + i * 60 * 1000;
+    const expectedTime =
+      bucketStart + i * 60 * 1000;
 
     if (bucket[i].time !== expectedTime) {
       return false;
@@ -294,26 +395,45 @@ export function aggregateCandlesTo5m(
 ): Candle[] {
   const result: Candle[] = [];
 
-  if (candles.length === 0) return result;
-  if (!validateCandles(candles)) return result;
+  if (candles.length === 0) {
+    return result;
+  }
+
+  if (!validateCandles(candles)) {
+    return result;
+  }
 
   let bucket: Candle[] = [];
-  let currentBucketStart: number | null = null;
+  let currentBucketStart:
+    | number
+    | null = null;
 
   const flushBucket = (): void => {
     if (
       bucket.length > 0 &&
       currentBucketStart !== null &&
-      (!dropIncompleteBuckets ||
-        isComplete5mBucket(bucket, currentBucketStart))
+      (
+        !dropIncompleteBuckets ||
+        isComplete5mBucket(
+          bucket,
+          currentBucketStart
+        )
+      )
     ) {
-      result.push(mergeBucket(bucket, currentBucketStart));
+      result.push(
+        mergeBucket(
+          bucket,
+          currentBucketStart
+        )
+      );
     }
   };
 
   for (const candle of candles) {
     const bucketStart =
-      Math.floor(candle.time / (5 * 60 * 1000)) *
+      Math.floor(
+        candle.time / (5 * 60 * 1000)
+      ) *
       (5 * 60 * 1000);
 
     if (
@@ -347,50 +467,79 @@ export function build1mIndicators(
   }
 
   const atrRaw = ATR.calculate({
-    high: candles.map(c => c.high),
-    low: candles.map(c => c.low),
-    close: candles.map(c => c.close),
+    high: candles.map(
+      candle => candle.high
+    ),
+    low: candles.map(
+      candle => candle.low
+    ),
+    close: candles.map(
+      candle => candle.close
+    ),
     period: params.atrPeriod1m
   });
 
   const volumeSmaRaw = SMA.calculate({
     period: params.volumeLookback1m,
-    values: candles.map(c => c.volume)
+    values: candles.map(
+      candle => candle.volume
+    )
   });
 
-  const atrSeries = padSeries(atrRaw, candles.length);
+  const atrSeries = padSeries(
+    atrRaw,
+    candles.length
+  );
+
   const volumeSmaSeries = padSeries(
     volumeSmaRaw,
     candles.length
   );
 
   const typicalPrices = candles.map(
-    candle => (candle.high + candle.low + candle.close) / 3
+    candle =>
+      (candle.high +
+        candle.low +
+        candle.close) /
+      3
   );
 
-  const indicators: BarIndicators1m[] = [];
+  const indicators: BarIndicators1m[] =
+    [];
 
-  for (let i = 0; i < candles.length; i++) {
+  for (
+    let index = 0;
+    index < candles.length;
+    index++
+  ) {
     const start = Math.max(
       0,
-      i - params.vwapPeriod1m + 1
+      index - params.vwapPeriod1m + 1
     );
 
     let priceVolume = 0;
     let totalVolume = 0;
 
-    for (let j = start; j <= i; j++) {
-      priceVolume += typicalPrices[j] * candles[j].volume;
+    for (
+      let j = start;
+      j <= index;
+      j++
+    ) {
+      priceVolume +=
+        typicalPrices[j] *
+        candles[j].volume;
+
       totalVolume += candles[j].volume;
     }
 
     indicators.push({
-      atr1m: atrSeries[i],
+      atr1m: atrSeries[index],
       vwap1m:
         totalVolume > 0
           ? priceVolume / totalVolume
           : null,
-      volumeSma1m: volumeSmaSeries[i]
+      volumeSma1m:
+        volumeSmaSeries[index]
     });
   }
 
@@ -411,11 +560,17 @@ export function build5mIndicators(
     }));
   }
 
-  const closes = candles5m.map(c => c.close);
+  const closes = candles5m.map(
+    candle => candle.close
+  );
 
   const atrRaw = ATR.calculate({
-    high: candles5m.map(c => c.high),
-    low: candles5m.map(c => c.low),
+    high: candles5m.map(
+      candle => candle.high
+    ),
+    low: candles5m.map(
+      candle => candle.low
+    ),
     close: closes,
     period: params.atrPeriod5m
   });
@@ -450,34 +605,50 @@ export function build5mIndicators(
     candles5m.length
   );
 
+  /**
+   * ATR.calculate() возвращает первое
+   * значение после накопления atrPeriod баров.
+   *
+   * SMA по ATR получает первое значение
+   * после trendAtrLookback значений ATR.
+   */
   const atrSmaFirstIndex =
     params.atrPeriod5m +
     params.trendAtrLookback5m -
     2;
 
-  const atrSmaSeries = alignDerivedSeries(
-    atrSmaRaw,
-    atrSmaFirstIndex,
-    candles5m.length
-  );
+  const atrSmaSeries =
+    alignDerivedSeries(
+      atrSmaRaw,
+      atrSmaFirstIndex,
+      candles5m.length
+    );
 
-  return candles5m.map((candle, index) => ({
-    atr5m: atrSeries[index],
-    atr5mSma: atrSmaSeries[index],
-    emaFast5m: emaFastSeries[index],
-    emaSlow5m: emaSlowSeries[index],
-    close5m: candle.close
-  }));
+  return candles5m.map(
+    (_candle, index) => ({
+      atr5m: atrSeries[index],
+      atr5mSma: atrSmaSeries[index],
+      emaFast5m:
+        emaFastSeries[index],
+      emaSlow5m:
+        emaSlowSeries[index],
+      close5m: closes[index]
+    })
+  );
 }
 
 export function map1mIndexTo5mIndex(
   candleTime: number,
   candles5m: Candle[]
 ): number {
-  if (candles5m.length === 0) return -1;
+  if (candles5m.length === 0) {
+    return -1;
+  }
 
   const bucketStart =
-    Math.floor(candleTime / (5 * 60 * 1000)) *
+    Math.floor(
+      candleTime / (5 * 60 * 1000)
+    ) *
     (5 * 60 * 1000);
 
   let left = 0;
@@ -485,9 +656,14 @@ export function map1mIndexTo5mIndex(
   let answer = -1;
 
   while (left <= right) {
-    const middle = Math.floor((left + right) / 2);
+    const middle = Math.floor(
+      (left + right) / 2
+    );
 
-    if (candles5m[middle].time <= bucketStart) {
+    if (
+      candles5m[middle].time <=
+      bucketStart
+    ) {
       answer = middle;
       left = middle + 1;
     } else {
@@ -502,24 +678,36 @@ export function map1mIndexToClosed5mIndex(
   candleTime: number,
   candles5m: Candle[]
 ): number {
-  if (candles5m.length === 0) return -1;
+  if (candles5m.length === 0) {
+    return -1;
+  }
 
   const currentBucketStart =
-    Math.floor(candleTime / (5 * 60 * 1000)) *
+    Math.floor(
+      candleTime / (5 * 60 * 1000)
+    ) *
     (5 * 60 * 1000);
 
+  /**
+   * 5m-свеча текущего bucket ещё не закрыта.
+   * Поэтому используется предыдущий bucket.
+   */
   const lastClosedBucketStart =
-    currentBucketStart - 5 * 60 * 1000;
+    currentBucketStart -
+    5 * 60 * 1000;
 
   let left = 0;
   let right = candles5m.length - 1;
   let answer = -1;
 
   while (left <= right) {
-    const middle = Math.floor((left + right) / 2);
+    const middle = Math.floor(
+      (left + right) / 2
+    );
 
     if (
-      candles5m[middle].time <= lastClosedBucketStart
+      candles5m[middle].time <=
+      lastClosedBucketStart
     ) {
       answer = middle;
       left = middle + 1;
@@ -531,7 +719,9 @@ export function map1mIndexToClosed5mIndex(
   return answer;
 }
 
-function getHourFractionUtc(time: number): number {
+function getHourFractionUtc(
+  time: number
+): number {
   const date = new Date(time);
 
   return (
@@ -545,7 +735,8 @@ function inSession(
   time: number,
   params: ScalpParams
 ): boolean {
-  const hour = getHourFractionUtc(time);
+  const hour =
+    getHourFractionUtc(time);
 
   return (
     hour >= params.sessionStartHour &&
@@ -553,18 +744,33 @@ function inSession(
   );
 }
 
-function calcBodyPct(candle: Candle): number {
-  if (candle.open <= 0) return 0;
+function calcBodyPct(
+  candle: Candle
+): number {
+  if (candle.open <= 0) {
+    return 0;
+  }
 
-  return Math.abs(candle.close - candle.open) / candle.open;
+  return (
+    Math.abs(
+      candle.close - candle.open
+    ) / candle.open
+  );
 }
 
-function calcCloseLocation(candle: Candle): number {
-  const range = candle.high - candle.low;
+function calcCloseLocation(
+  candle: Candle
+): number {
+  const range =
+    candle.high - candle.low;
 
-  if (range <= 0) return 0.5;
+  if (range <= 0) {
+    return 0.5;
+  }
 
-  return (candle.close - candle.low) / range;
+  return (
+    candle.close - candle.low
+  ) / range;
 }
 
 function calcVolumeRatio(
@@ -578,13 +784,24 @@ function calcVolumeRatio(
     return 0;
   }
 
-  return candle.volume / indicators.volumeSma1m;
+  return (
+    candle.volume /
+    indicators.volumeSma1m
+  );
 }
 
-function calcDistancePct(a: number, b: number): number {
-  if (b === 0) return 0;
+function calcDistancePct(
+  a: number,
+  b: number
+): number {
+  if (b === 0) {
+    return 0;
+  }
 
-  return Math.abs(a - b) / Math.abs(b);
+  return (
+    Math.abs(a - b) /
+    Math.abs(b)
+  );
 }
 
 function highestHigh(
@@ -592,13 +809,19 @@ function highestHigh(
   from: number,
   to: number
 ): number {
-  if (from > to) return -Infinity;
+  if (from > to) {
+    return -Infinity;
+  }
 
   let high = -Infinity;
 
   for (
     let index = Math.max(0, from);
-    index <= Math.min(to, candles.length - 1);
+    index <=
+    Math.min(
+      to,
+      candles.length - 1
+    );
     index++
   ) {
     if (candles[index].high > high) {
@@ -614,13 +837,19 @@ function lowestLow(
   from: number,
   to: number
 ): number {
-  if (from > to) return Infinity;
+  if (from > to) {
+    return Infinity;
+  }
 
   let low = Infinity;
 
   for (
     let index = Math.max(0, from);
-    index <= Math.min(to, candles.length - 1);
+    index <=
+    Math.min(
+      to,
+      candles.length - 1
+    );
     index++
   ) {
     if (candles[index].low < low) {
@@ -638,26 +867,38 @@ function detectPullbackLong(
 ): number | null {
   const from = index - lookback;
 
-  if (from < 1 || index - 1 < from) {
+  if (
+    from < 1 ||
+    index - 1 < from
+  ) {
     return null;
   }
 
-  const recentHigh = highestHigh(
-    candles,
-    from,
-    index - 1
-  );
+  const recentHigh =
+    highestHigh(
+      candles,
+      from,
+      index - 1
+    );
 
-  const previousClose = candles[index - 1].close;
+  const previousClose =
+    candles[index - 1].close;
 
-  if (!Number.isFinite(recentHigh) || recentHigh <= 0) {
+  if (
+    !Number.isFinite(recentHigh) ||
+    recentHigh <= 0
+  ) {
     return null;
   }
 
   const pullbackPct =
-    (recentHigh - previousClose) / recentHigh;
+    (recentHigh - previousClose) /
+    recentHigh;
 
-  return Math.max(0, pullbackPct);
+  return Math.max(
+    0,
+    pullbackPct
+  );
 }
 
 function detectPullbackShort(
@@ -667,29 +908,43 @@ function detectPullbackShort(
 ): number | null {
   const from = index - lookback;
 
-  if (from < 1 || index - 1 < from) {
+  if (
+    from < 1 ||
+    index - 1 < from
+  ) {
     return null;
   }
 
-  const recentLow = lowestLow(
-    candles,
-    from,
-    index - 1
-  );
+  const recentLow =
+    lowestLow(
+      candles,
+      from,
+      index - 1
+    );
 
-  const previousClose = candles[index - 1].close;
+  const previousClose =
+    candles[index - 1].close;
 
-  if (!Number.isFinite(recentLow) || recentLow <= 0) {
+  if (
+    !Number.isFinite(recentLow) ||
+    recentLow <= 0
+  ) {
     return null;
   }
 
   const pullbackPct =
-    (previousClose - recentLow) / recentLow;
+    (previousClose - recentLow) /
+    recentLow;
 
-  return Math.max(0, pullbackPct);
+  return Math.max(
+    0,
+    pullbackPct
+  );
 }
 
-function assertValidParams(params: ScalpParams): void {
+function assertValidParams(
+  params: ScalpParams
+): void {
   const positiveValues = [
     params.atrPeriod1m,
     params.atrPeriod5m,
@@ -705,11 +960,13 @@ function assertValidParams(params: ScalpParams): void {
 
   if (
     positiveValues.some(
-      value => !Number.isFinite(value) || value <= 0
+      value =>
+        !Number.isFinite(value) ||
+        value <= 0
     )
   ) {
     throw new Error(
-      'Scalp parameters must contain positive periods and multipliers'
+      "Scalp parameters must contain positive periods and multipliers"
     );
   }
 
@@ -721,7 +978,7 @@ function assertValidParams(params: ScalpParams): void {
     params.maxPositionNotionalPct <= 0
   ) {
     throw new Error(
-      'Risk, cost and position parameters are invalid'
+      "Risk, cost and position parameters are invalid"
     );
   }
 
@@ -732,7 +989,18 @@ function assertValidParams(params: ScalpParams): void {
     params.maxCloseLocationShort > 1
   ) {
     throw new Error(
-      'Close-location parameters must be between 0 and 1'
+      "Close-location parameters must be between 0 and 1"
+    );
+  }
+
+  if (
+    params.sessionStartHour < 0 ||
+    params.sessionStartHour > 24 ||
+    params.sessionEndHour < 0 ||
+    params.sessionEndHour > 24
+  ) {
+    throw new Error(
+      "Session hours must be between 0 and 24"
     );
   }
 }
@@ -741,13 +1009,20 @@ export function floorToStep(
   value: number,
   step: number
 ): number {
-  if (!Number.isFinite(value) || !Number.isFinite(step)) {
+  if (
+    !Number.isFinite(value) ||
+    !Number.isFinite(step)
+  ) {
     return 0;
   }
 
-  if (step <= 0) return value;
+  if (step <= 0) {
+    return value;
+  }
 
-  return Math.floor(value / step) * step;
+  return Math.floor(
+    value / step
+  ) * step;
 }
 
 export function calculatePositionSize(
@@ -760,7 +1035,10 @@ export function calculatePositionSize(
     riskPerTrade,
     maxRiskPerTrade,
     maxPositionNotionalPct,
-    contractMultiplier = 1
+    commissionRate = 0,
+    contractMultiplier = 1,
+    minPositionSize = 0,
+    positionSizeStep = 1
   } = input;
 
   if (
@@ -770,39 +1048,79 @@ export function calculatePositionSize(
     entryPrice <= 0 ||
     !Number.isFinite(stopPrice) ||
     stopPrice <= 0 ||
-    contractMultiplier <= 0
+    contractMultiplier <= 0 ||
+    commissionRate < 0
   ) {
     return 0;
   }
 
+  const riskFraction = Math.min(
+    Math.max(0, riskPerTrade),
+    Math.max(0, maxRiskPerTrade)
+  );
+
   const riskBudget =
-    equity *
-    Math.min(
-      Math.max(0, riskPerTrade),
-      Math.max(0, maxRiskPerTrade)
-    );
+    equity * riskFraction;
 
-  const riskPerUnit =
-    Math.abs(entryPrice - stopPrice) *
-    contractMultiplier;
+  const priceRiskPerUnit =
+    Math.abs(
+      entryPrice - stopPrice
+    ) * contractMultiplier;
 
-  if (riskBudget <= 0 || riskPerUnit <= 0) {
+  const commissionRiskPerUnit =
+    entryPrice *
+    contractMultiplier *
+    commissionRate;
+
+  const totalRiskPerUnit =
+    priceRiskPerUnit +
+    commissionRiskPerUnit;
+
+  if (
+    riskBudget <= 0 ||
+    totalRiskPerUnit <= 0
+  ) {
     return 0;
   }
 
-  const sizeByRisk = riskBudget / riskPerUnit;
+  const sizeByRisk =
+    riskBudget / totalRiskPerUnit;
 
   const maxNotional =
-    equity * Math.max(0, maxPositionNotionalPct);
+    equity *
+    Math.max(
+      0,
+      maxPositionNotionalPct
+    );
 
   const sizeByNotional =
     maxNotional /
     (entryPrice * contractMultiplier);
 
-  return Math.max(
-    0,
-    Math.min(sizeByRisk, sizeByNotional)
+  const rawSize = Math.min(
+    sizeByRisk,
+    sizeByNotional
   );
+
+  if (
+    rawSize < minPositionSize
+  ) {
+    return 0;
+  }
+
+  const roundedSize =
+    floorToStep(
+      rawSize,
+      positionSizeStep
+    );
+
+  if (
+    roundedSize < minPositionSize
+  ) {
+    return 0;
+  }
+
+  return roundedSize;
 }
 
 function getRoundTripCostPct(
@@ -814,7 +1132,10 @@ function getRoundTripCostPct(
   const slippageRoundTrip =
     params.slippageRate * 2;
 
-  return commissionRoundTrip + slippageRoundTrip;
+  return (
+    commissionRoundTrip +
+    slippageRoundTrip
+  );
 }
 
 function hasEnoughTargetAfterCosts(
@@ -825,10 +1146,12 @@ function hasEnoughTargetAfterCosts(
     getRoundTripCostPct(params);
 
   const minimumByCost =
-    roundTripCostPct * params.minCostCoverage;
+    roundTripCostPct *
+    params.minCostCoverage;
 
   return (
-    targetMovePct >= params.minTargetMovePct &&
+    targetMovePct >=
+      params.minTargetMovePct &&
     targetMovePct >= minimumByCost
   );
 }
@@ -836,7 +1159,6 @@ function hasEnoughTargetAfterCosts(
 function createLongSignal(
   candles1m: Candle[],
   indicators1m: BarIndicators1m[],
-  candles5m: Candle[],
   indicators5m: BarIndicators5m[],
   signalIndex: number,
   entryIndex: number,
@@ -848,36 +1170,44 @@ function createLongSignal(
   closeLocation: number,
   breakoutLevel: number
 ): ScalpSignal | null {
-  const signalCandle = candles1m[signalIndex];
-  const entryCandle = candles1m[entryIndex];
-  const ind1m = indicators1m[signalIndex];
-  const ctx5m = indicators5m[idx5m];
+  const entryCandle =
+    candles1m[entryIndex];
+
+  const ind1m =
+    indicators1m[signalIndex];
+
+  const ctx5m =
+    indicators5m[idx5m];
 
   if (
-    ind1m.atr1m === null ||
-    ind1m.vwap1m === null ||
-    ctx5m.atr5m === null
+    !isFinitePositive(ind1m.atr1m) ||
+    !isFinitePositive(ind1m.vwap1m) ||
+    !isFinitePositive(ctx5m.atr5m)
   ) {
     return null;
   }
 
-  const rawEntryPrice = Math.max(
-    entryCandle.open,
-    breakoutLevel
-  );
+  const rawEntryPrice =
+    Math.max(
+      entryCandle.open,
+      breakoutLevel
+    );
 
   const entryPrice =
-    rawEntryPrice * (1 + params.slippageRate);
+    rawEntryPrice *
+    (1 + params.slippageRate);
 
   const stopDistance =
-    ind1m.atr1m * params.atrSlMult;
+    ind1m.atr1m *
+    params.atrSlMult;
 
   const stopLossPrice =
     entryPrice - stopDistance;
 
   const takeProfitPrice =
     entryPrice +
-    ind1m.atr1m * params.atrTpMult;
+    ind1m.atr1m *
+    params.atrTpMult;
 
   const targetMovePct =
     (takeProfitPrice - entryPrice) /
@@ -892,8 +1222,11 @@ function createLongSignal(
     return null;
   }
 
+  const signalCandle =
+    candles1m[signalIndex];
+
   return {
-    side: 'long',
+    side: "long",
 
     signalIndex,
     entryIndex,
@@ -919,12 +1252,18 @@ function createLongSignal(
     pullbackPct,
     volumeRatio,
 
-    entryCommissionPct: params.commissionRate,
-    estimatedExitCommissionPct: params.commissionRate,
+    entryCommissionPct:
+      params.commissionRate,
+
+    estimatedExitCommissionPct:
+      params.commissionRate,
+
     estimatedRoundTripSlippagePct:
       params.slippageRate * 2,
+
     estimatedRoundTripCostPct:
       getRoundTripCostPct(params),
+
     expectedNetTargetMovePct:
       targetMovePct -
       getRoundTripCostPct(params)
@@ -934,7 +1273,6 @@ function createLongSignal(
 function createShortSignal(
   candles1m: Candle[],
   indicators1m: BarIndicators1m[],
-  candles5m: Candle[],
   indicators5m: BarIndicators5m[],
   signalIndex: number,
   entryIndex: number,
@@ -946,36 +1284,44 @@ function createShortSignal(
   closeLocation: number,
   breakoutLevel: number
 ): ScalpSignal | null {
-  const signalCandle = candles1m[signalIndex];
-  const entryCandle = candles1m[entryIndex];
-  const ind1m = indicators1m[signalIndex];
-  const ctx5m = indicators5m[idx5m];
+  const entryCandle =
+    candles1m[entryIndex];
+
+  const ind1m =
+    indicators1m[signalIndex];
+
+  const ctx5m =
+    indicators5m[idx5m];
 
   if (
-    ind1m.atr1m === null ||
-    ind1m.vwap1m === null ||
-    ctx5m.atr5m === null
+    !isFinitePositive(ind1m.atr1m) ||
+    !isFinitePositive(ind1m.vwap1m) ||
+    !isFinitePositive(ctx5m.atr5m)
   ) {
     return null;
   }
 
-  const rawEntryPrice = Math.min(
-    entryCandle.open,
-    breakoutLevel
-  );
+  const rawEntryPrice =
+    Math.min(
+      entryCandle.open,
+      breakoutLevel
+    );
 
   const entryPrice =
-    rawEntryPrice * (1 - params.slippageRate);
+    rawEntryPrice *
+    (1 - params.slippageRate);
 
   const stopDistance =
-    ind1m.atr1m * params.atrSlMult;
+    ind1m.atr1m *
+    params.atrSlMult;
 
   const stopLossPrice =
     entryPrice + stopDistance;
 
   const takeProfitPrice =
     entryPrice -
-    ind1m.atr1m * params.atrTpMult;
+    ind1m.atr1m *
+    params.atrTpMult;
 
   const targetMovePct =
     (entryPrice - takeProfitPrice) /
@@ -990,8 +1336,11 @@ function createShortSignal(
     return null;
   }
 
+  const signalCandle =
+    candles1m[signalIndex];
+
   return {
-    side: 'short',
+    side: "short",
 
     signalIndex,
     entryIndex,
@@ -1017,12 +1366,18 @@ function createShortSignal(
     pullbackPct,
     volumeRatio,
 
-    entryCommissionPct: params.commissionRate,
-    estimatedExitCommissionPct: params.commissionRate,
+    entryCommissionPct:
+      params.commissionRate,
+
+    estimatedExitCommissionPct:
+      params.commissionRate,
+
     estimatedRoundTripSlippagePct:
       params.slippageRate * 2,
+
     estimatedRoundTripCostPct:
       getRoundTripCostPct(params),
+
     expectedNetTargetMovePct:
       targetMovePct -
       getRoundTripCostPct(params)
@@ -1045,7 +1400,7 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: 'invalid_data'
+      reason: "invalid_data"
     };
   }
 
@@ -1056,39 +1411,53 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: 'not_enough_history'
+      reason: "not_enough_history"
     };
   }
 
-  const signalCandle = candles1m[signalIndex];
-  const entryCandle = candles1m[signalIndex + 1];
-  const ind1m = indicators1m[signalIndex];
+  const signalCandle =
+    candles1m[signalIndex];
+
+  const entryCandle =
+    candles1m[signalIndex + 1];
+
+  const ind1m =
+    indicators1m[signalIndex];
 
   if (
-    !inSession(signalCandle.time, params) ||
-    !inSession(entryCandle.time, params)
+    !inSession(
+      signalCandle.time,
+      params
+    ) ||
+    !inSession(
+      entryCandle.time,
+      params
+    )
   ) {
     return {
       accepted: false,
-      reason: 'outside_session'
+      reason: "outside_session"
     };
   }
 
   if (
     !isFinitePositive(ind1m.atr1m) ||
     !isFinitePositive(ind1m.vwap1m) ||
-    !isFinitePositive(ind1m.volumeSma1m)
+    !isFinitePositive(
+      ind1m.volumeSma1m
+    )
   ) {
     return {
       accepted: false,
-      reason: 'missing_context'
+      reason: "missing_context"
     };
   }
 
-  const idx5m = map1mIndexToClosed5mIndex(
-    signalCandle.time,
-    candles5m
-  );
+  const idx5m =
+    map1mIndexToClosed5mIndex(
+      signalCandle.time,
+      candles5m
+    );
 
   if (
     idx5m < 1 ||
@@ -1096,77 +1465,100 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: 'missing_context'
+      reason: "missing_context"
     };
   }
 
-  const ctx5m = indicators5m[idx5m];
-  const previousCtx5m = indicators5m[idx5m - 1];
+  const ctx5m =
+    indicators5m[idx5m];
+
+  const previousCtx5m =
+    indicators5m[idx5m - 1];
 
   if (
     !isFinitePositive(ctx5m.atr5m) ||
     !isFinitePositive(ctx5m.atr5mSma) ||
-    !isFinitePositive(ctx5m.emaFast5m) ||
-    !isFinitePositive(ctx5m.emaSlow5m) ||
-    !isFinitePositive(ctx5m.close5m)
+    !isFinitePositive(
+      ctx5m.emaFast5m
+    ) ||
+    !isFinitePositive(
+      ctx5m.emaSlow5m
+    ) ||
+    !isFinitePositive(
+      ctx5m.close5m
+    )
   ) {
     return {
       accepted: false,
-      reason: 'missing_context'
+      reason: "missing_context"
     };
   }
+
+  const previousAtr =
+    previousCtx5m?.atr5m;
+
+  const atrHasPreviousValue =
+    Number.isFinite(previousAtr) &&
+    Number(previousAtr) > 0;
 
   const atrExpanding =
     ctx5m.atr5m >=
       ctx5m.atr5mSma *
         params.trendAtrExpandRatio5m &&
     (
-      previousCtx5m?.atr5m === null ||
-      previousCtx5m?.atr5m === undefined ||
-      ctx5m.atr5m >= previousCtx5m.atr5m
+      !atrHasPreviousValue ||
+      ctx5m.atr5m >=
+        Number(previousAtr)
     );
 
   if (!atrExpanding) {
     return {
       accepted: false,
-      reason: 'atr_not_expanding'
+      reason: "atr_not_expanding"
     };
   }
 
-  const volumeRatio = calcVolumeRatio(
-    signalCandle,
-    ind1m
-  );
+  const volumeRatio =
+    calcVolumeRatio(
+      signalCandle,
+      ind1m
+    );
 
   if (
     !Number.isFinite(volumeRatio) ||
-    volumeRatio < params.volumeMinRatio1m
+    volumeRatio <
+      params.volumeMinRatio1m
   ) {
     return {
       accepted: false,
-      reason: 'volume_too_small'
+      reason: "volume_too_small"
     };
   }
 
-  const bodyPct = calcBodyPct(signalCandle);
+  const bodyPct =
+    calcBodyPct(signalCandle);
 
   if (
     !Number.isFinite(bodyPct) ||
-    bodyPct < params.minImpulseBodyPct
+    bodyPct <
+      params.minImpulseBodyPct
   ) {
     return {
       accepted: false,
-      reason: 'impulse_too_small'
+      reason: "impulse_too_small"
     };
   }
 
   const closeLocation =
-    calcCloseLocation(signalCandle);
+    calcCloseLocation(
+      signalCandle
+    );
 
-  const vwapDistancePct = calcDistancePct(
-    signalCandle.close,
-    ind1m.vwap1m
-  );
+  const vwapDistancePct =
+    calcDistancePct(
+      signalCandle.close,
+      ind1m.vwap1m
+    );
 
   if (
     vwapDistancePct >
@@ -1174,38 +1566,47 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: 'too_far_from_vwap'
+      reason: "too_far_from_vwap"
     };
   }
 
   const is5mLongTrend =
-    ctx5m.emaFast5m > ctx5m.emaSlow5m &&
-    ctx5m.close5m > ctx5m.emaFast5m;
+    ctx5m.emaFast5m >
+      ctx5m.emaSlow5m &&
+    ctx5m.close5m >
+      ctx5m.emaFast5m;
 
   const is5mShortTrend =
-    ctx5m.emaFast5m < ctx5m.emaSlow5m &&
-    ctx5m.close5m < ctx5m.emaFast5m;
+    ctx5m.emaFast5m <
+      ctx5m.emaSlow5m &&
+    ctx5m.close5m <
+      ctx5m.emaFast5m;
 
   if (
-    is5mLongTrend === is5mShortTrend
+    is5mLongTrend ===
+    is5mShortTrend
   ) {
     return {
       accepted: false,
-      reason: 'trend_not_aligned'
+      reason: "trend_not_aligned"
     };
   }
 
-  const recentHigh = highestHigh(
-    candles1m,
-    signalIndex - params.pullbackLookback1m,
-    signalIndex - 1
-  );
+  const recentHigh =
+    highestHigh(
+      candles1m,
+      signalIndex -
+        params.pullbackLookback1m,
+      signalIndex - 1
+    );
 
-  const recentLow = lowestLow(
-    candles1m,
-    signalIndex - params.pullbackLookback1m,
-    signalIndex - 1
-  );
+  const recentLow =
+    lowestLow(
+      candles1m,
+      signalIndex -
+        params.pullbackLookback1m,
+      signalIndex - 1
+    );
 
   if (
     !Number.isFinite(recentHigh) ||
@@ -1215,7 +1616,7 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: 'missing_context'
+      reason: "missing_context"
     };
   }
 
@@ -1253,7 +1654,7 @@ export function evaluateMomentumScalpEntry(
     ) {
       return {
         accepted: false,
-        reason: 'impulse_too_small'
+        reason: "impulse_too_small"
       };
     }
 
@@ -1264,7 +1665,7 @@ export function evaluateMomentumScalpEntry(
     ) {
       return {
         accepted: false,
-        reason: 'pullback_too_small'
+        reason: "pullback_too_small"
       };
     }
 
@@ -1275,30 +1676,31 @@ export function evaluateMomentumScalpEntry(
     if (!longBreakout) {
       return {
         accepted: false,
-        reason: 'breakout_missing'
+        reason: "breakout_missing"
       };
     }
 
-    const signal = createLongSignal(
-      candles1m,
-      indicators1m,
-      candles5m,
-      indicators5m,
-      signalIndex,
-      signalIndex + 1,
-      idx5m,
-      params,
-      longPullbackPct,
-      volumeRatio,
-      bodyPct,
-      closeLocation,
-      longBreakoutLevel
-    );
+    const signal =
+      createLongSignal(
+        candles1m,
+        indicators1m,
+        indicators5m,
+        signalIndex,
+        signalIndex + 1,
+        idx5m,
+        params,
+        longPullbackPct,
+        volumeRatio,
+        bodyPct,
+        closeLocation,
+        longBreakoutLevel
+      );
 
     if (!signal) {
       return {
         accepted: false,
-        reason: 'target_too_small_for_costs'
+        reason:
+          "target_too_small_for_costs"
       };
     }
 
@@ -1320,7 +1722,7 @@ export function evaluateMomentumScalpEntry(
     ) {
       return {
         accepted: false,
-        reason: 'impulse_too_small'
+        reason: "impulse_too_small"
       };
     }
 
@@ -1331,7 +1733,7 @@ export function evaluateMomentumScalpEntry(
     ) {
       return {
         accepted: false,
-        reason: 'pullback_too_small'
+        reason: "pullback_too_small"
       };
     }
 
@@ -1342,30 +1744,31 @@ export function evaluateMomentumScalpEntry(
     if (!shortBreakout) {
       return {
         accepted: false,
-        reason: 'breakout_missing'
+        reason: "breakout_missing"
       };
     }
 
-    const signal = createShortSignal(
-      candles1m,
-      indicators1m,
-      candles5m,
-      indicators5m,
-      signalIndex,
-      signalIndex + 1,
-      idx5m,
-      params,
-      shortPullbackPct,
-      volumeRatio,
-      bodyPct,
-      closeLocation,
-      shortBreakoutLevel
-    );
+    const signal =
+      createShortSignal(
+        candles1m,
+        indicators1m,
+        indicators5m,
+        signalIndex,
+        signalIndex + 1,
+        idx5m,
+        params,
+        shortPullbackPct,
+        volumeRatio,
+        bodyPct,
+        closeLocation,
+        shortBreakoutLevel
+      );
 
     if (!signal) {
       return {
         accepted: false,
-        reason: 'target_too_small_for_costs'
+        reason:
+          "target_too_small_for_costs"
       };
     }
 
@@ -1377,6 +1780,319 @@ export function evaluateMomentumScalpEntry(
 
   return {
     accepted: false,
-    reason: 'no_signal'
+    reason: "no_signal"
   };
 }
+
+export class ScalpStrategy {
+  private readonly params: ScalpParams;
+
+  constructor(
+    params?: Partial<ScalpParams>
+  ) {
+    this.params = {
+      ...DEFAULT_SCALP_PARAMS,
+      commissionRate:
+        config.commissionRate,
+      slippageRate:
+        config.slippageRate,
+      ...params
+    };
+
+    assertValidParams(
+      this.params
+    );
+  }
+
+  getParams(): ScalpParams {
+    return {
+      ...this.params
+    };
+  }
+
+  build1mIndicators(
+    candles: Candle[]
+  ): BarIndicators1m[] {
+    return build1mIndicators(
+      candles,
+      this.params
+    );
+  }
+
+  build5mIndicators(
+    candles: Candle[]
+  ): BarIndicators5m[] {
+    return build5mIndicators(
+      candles,
+      this.params
+    );
+  }
+
+  evaluateEntry(
+    candles1m: Candle[],
+    indicators1m: BarIndicators1m[],
+    candles5m: Candle[],
+    indicators5m: BarIndicators5m[],
+    signalIndex: number
+  ): EntryDecision {
+    return evaluateMomentumScalpEntry(
+      candles1m,
+      indicators1m,
+      candles5m,
+      indicators5m,
+      signalIndex,
+      this.params
+    );
+  }
+
+  calculatePositionSize(
+    entryPrice: number,
+    stopPrice: number,
+    equity = config.virtualBalance
+  ): number {
+    return calculatePositionSize({
+      equity,
+      entryPrice,
+      stopPrice,
+
+      riskPerTrade:
+        this.params.riskPerTrade,
+
+      maxRiskPerTrade:
+        this.params.maxRiskPerTrade,
+
+      maxPositionNotionalPct:
+        this.params
+          .maxPositionNotionalPct,
+
+      commissionRate:
+        this.params.commissionRate,
+
+      contractMultiplier:
+        this.params.contractMultiplier ??
+        1,
+
+      minPositionSize:
+        this.params.minPositionSize ??
+        0,
+
+      positionSizeStep:
+        this.params.positionSizeStep ??
+        1
+    });
+  }
+
+  async getCurrentPrice(
+    symbol: string
+  ): Promise<number> {
+    return tbankClient.getCurrentPrice(
+      symbol
+    );
+  }
+
+  determineRegime(
+    candles: Candle[]
+  ): RegimeResult {
+    if (
+      !validateCandles(candles) ||
+      candles.length < 30
+    ) {
+      return {
+        regime:
+          candles.length === 0
+            ? "no_data"
+            : "not_ready",
+        ready: false
+      };
+    }
+
+    const candles5m =
+      aggregateCandlesTo5m(
+        candles,
+        true
+      );
+
+    if (candles5m.length < 3) {
+      return {
+        regime: "not_ready",
+        ready: false
+      };
+    }
+
+    const indicators5m =
+      this.build5mIndicators(
+        candles5m
+      );
+
+    const index =
+      indicators5m.length - 1;
+
+    const current =
+      indicators5m[index];
+
+    if (
+      !isFinitePositive(
+        current.emaFast5m
+      ) ||
+      !isFinitePositive(
+        current.emaSlow5m
+      ) ||
+      !isFinitePositive(
+        current.close5m
+      )
+    ) {
+      return {
+        regime: "not_ready",
+        ready: false
+      };
+    }
+
+    if (
+      current.emaFast5m >
+        current.emaSlow5m &&
+      current.close5m >
+        current.emaFast5m
+    ) {
+      return {
+        regime: "bullish",
+        ready: true
+      };
+    }
+
+    if (
+      current.emaFast5m <
+        current.emaSlow5m &&
+      current.close5m <
+        current.emaFast5m
+    ) {
+      return {
+        regime: "bearish",
+        ready: true
+      };
+    }
+
+    return {
+      regime: "flat",
+      ready: true
+    };
+  }
+
+  calculateSignal(
+    candles: Candle[],
+    _symbol?: string
+  ): LegacySignalResult {
+    if (
+      !validateCandles(candles) ||
+      candles.length < 3
+    ) {
+      return {
+        ready: false,
+        buy: false,
+        sell: false,
+        side: "none",
+        regime: "not_ready",
+        signal: null,
+        reason: "not_enough_history",
+        indicators: {
+          ready: false
+        }
+      };
+    }
+
+    const candles1m = candles;
+    const candles5m =
+      aggregateCandlesTo5m(
+        candles1m,
+        true
+      );
+
+    const indicators1m =
+      this.build1mIndicators(
+        candles1m
+      );
+
+    const indicators5m =
+      this.build5mIndicators(
+        candles5m
+      );
+
+    const signalIndex =
+      candles1m.length - 2;
+
+    const decision =
+      this.evaluateEntry(
+        candles1m,
+        indicators1m,
+        candles5m,
+        indicators5m,
+        signalIndex
+      );
+
+    const signal =
+      decision.signal || null;
+
+    const regime =
+      this.determineRegime(
+        candles1m
+      );
+
+    const last1m =
+      indicators1m[
+        indicators1m.length - 1
+      ];
+
+    const last5m =
+      indicators5m[
+        indicators5m.length - 1
+      ];
+
+    const positionSize =
+      signal
+        ? this.calculatePositionSize(
+            signal.entryPrice,
+            signal.stopLossPrice
+          )
+        : undefined;
+
+    return {
+      ready: true,
+      buy:
+        Boolean(signal) &&
+        signal?.side === "long",
+      sell:
+        Boolean(signal) &&
+        signal?.side === "short",
+      side:
+        signal?.side || "none",
+      regime: regime.regime,
+      positionSize,
+      takeProfitPrice:
+        signal?.takeProfitPrice,
+      stopLossPrice:
+        signal?.stopLossPrice,
+      signal,
+      reason: decision.reason,
+      indicators: {
+        atr1m:
+          last1m?.atr1m ?? null,
+        atr5m:
+          last5m?.atr5m ?? null,
+        vwap1m:
+          last1m?.vwap1m ?? null,
+        emaFast5m:
+          last5m?.emaFast5m ?? null,
+        emaSlow5m:
+          last5m?.emaSlow5m ?? null,
+        lastAtr:
+          last1m?.atr1m ?? null,
+        ready:
+          Boolean(
+            last1m?.atr1m &&
+            last5m?.atr5m
+          )
+      }
+    };
+  }
+}
+
+export default ScalpStrategy;
