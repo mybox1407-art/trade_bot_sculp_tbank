@@ -12,14 +12,16 @@ import csvLogService from "./CsvLogService";
 import telegramService from "./TelegramService";
 
 export class PositionService {
-  private readonly positions: Map<
-    string,
-    Position
-  > = new Map();
+  private readonly positions =
+    new Map<string, Position>();
 
   private readonly account: AccountState = {
-    initialBalance: config.virtualBalance,
-    cashBalance: config.virtualBalance,
+    initialBalance:
+      config.virtualBalance,
+
+    cashBalance:
+      config.virtualBalance,
+
     realizedPnl: 0,
     totalCommissions: 0,
     updatedAt: Date.now()
@@ -41,7 +43,14 @@ export class PositionService {
     return Array.from(
       this.positions.values()
     ).filter(
-      position => position.status === "open"
+      position =>
+        position.status === "open"
+    );
+  }
+
+  getAllPositions(): Position[] {
+    return Array.from(
+      this.positions.values()
     );
   }
 
@@ -51,10 +60,69 @@ export class PositionService {
     return this.positions.get(symbol);
   }
 
-  getAllPositions(): Position[] {
-    return Array.from(
-      this.positions.values()
+  getAvailableBalance(): number {
+    return Math.max(
+      0,
+      this.account.cashBalance
     );
+  }
+
+  getCurrentPositionLimit(): number {
+    return (
+      this.getAvailableBalance() *
+      config.maxPositionNotionalPct
+    );
+  }
+
+  canOpenPosition(
+    symbol: string
+  ): boolean {
+    if (
+      this.positions.has(symbol)
+    ) {
+      return false;
+    }
+
+    return (
+      this.getOpenPositions()
+        .length <
+      config.maxOpenPositions
+    );
+  }
+
+  calculateMaxQuantity(
+    entryPrice: number
+  ): number {
+    if (
+      !Number.isFinite(entryPrice) ||
+      entryPrice <= 0
+    ) {
+      return 0;
+    }
+
+    const maxNotional =
+      this.getCurrentPositionLimit();
+
+    const rawQuantity =
+      maxNotional /
+      entryPrice /
+      config.contractMultiplier;
+
+    const steppedQuantity =
+      Math.floor(
+        rawQuantity /
+          config.positionSizeStep
+      ) *
+      config.positionSizeStep;
+
+    if (
+      steppedQuantity <
+      config.minPositionSize
+    ) {
+      return 0;
+    }
+
+    return steppedQuantity;
   }
 
   private applyEntrySlippage(
@@ -62,10 +130,16 @@ export class PositionService {
     price: number
   ): number {
     if (side === "long") {
-      return price * (1 + this.slippageRate);
+      return (
+        price *
+        (1 + this.slippageRate)
+      );
     }
 
-    return price * (1 - this.slippageRate);
+    return (
+      price *
+      (1 - this.slippageRate)
+    );
   }
 
   private applyExitSlippage(
@@ -73,10 +147,16 @@ export class PositionService {
     price: number
   ): number {
     if (side === "long") {
-      return price * (1 - this.slippageRate);
+      return (
+        price *
+        (1 - this.slippageRate)
+      );
     }
 
-    return price * (1 + this.slippageRate);
+    return (
+      price *
+      (1 + this.slippageRate)
+    );
   }
 
   openPosition(
@@ -92,9 +172,10 @@ export class PositionService {
       signal
     } = request;
 
-    if (!symbol) {
+    if (!this.canOpenPosition(symbol)) {
       throw new Error(
-        "Symbol is required"
+        `Cannot open position for ${symbol}: ` +
+          "position limit reached or symbol already has a position"
       );
     }
 
@@ -125,12 +206,6 @@ export class PositionService {
       );
     }
 
-    if (this.getPosition(symbol)) {
-      throw new Error(
-        `Position already exists for ${symbol}`
-      );
-    }
-
     const executedEntryPrice =
       this.applyEntrySlippage(
         side,
@@ -138,44 +213,70 @@ export class PositionService {
       );
 
     const notional =
-      executedEntryPrice * quantity;
+      executedEntryPrice *
+      quantity *
+      config.contractMultiplier;
+
+    const maxNotional =
+      this.getCurrentPositionLimit();
+
+    if (
+      notional > maxNotional
+    ) {
+      throw new Error(
+        `Position notional ${notional.toFixed(2)} ` +
+          `exceeds current limit ${maxNotional.toFixed(2)}`
+      );
+    }
 
     const commissionOpen =
-      notional * this.commissionRate;
+      notional *
+      this.commissionRate;
 
     if (
       this.account.cashBalance <
       commissionOpen
     ) {
       throw new Error(
-        "Insufficient cash balance for commission"
+        "Insufficient balance for opening commission"
       );
     }
 
     this.account.cashBalance -=
       commissionOpen;
 
+    this.account.realizedPnl -=
+      commissionOpen;
+
     this.account.totalCommissions +=
       commissionOpen;
 
-    this.account.updatedAt = Date.now();
+    this.account.updatedAt =
+      Date.now();
 
     const position: Position = {
       id: randomUUID(),
       symbol,
       side,
+
       entryPrice: executedEntryPrice,
       stopLossPrice,
       takeProfitPrice,
+
       quantity,
       notional,
+
       entryTime: Date.now(),
       status: "open",
+
       commissionOpen,
       signal
     };
 
-    this.positions.set(symbol, position);
+    this.positions.set(
+      symbol,
+      position
+    );
 
     csvLogService.logPositionOpened(
       position
@@ -185,7 +286,10 @@ export class PositionService {
       "position_opened",
       symbol,
       `Position opened: ${side}`,
-      position
+      {
+        position,
+        account: this.account
+      }
     );
 
     void telegramService.notifyPositionOpened(
@@ -194,8 +298,10 @@ export class PositionService {
 
     logger.info(
       `Position opened: ${symbol} ` +
-      `${side} @ ${executedEntryPrice}, ` +
-      `quantity=${quantity}`
+        `${side} @ ${executedEntryPrice}, ` +
+        `quantity=${quantity}, ` +
+        `notional=${notional}, ` +
+        `balance=${this.account.cashBalance}`
     );
 
     return {
@@ -207,7 +313,9 @@ export class PositionService {
     request: ClosePositionRequest
   ): Position | undefined {
     const position =
-      this.positions.get(request.symbol);
+      this.positions.get(
+        request.symbol
+      );
 
     if (
       !position ||
@@ -226,16 +334,21 @@ export class PositionService {
       position.side === "long"
         ? (
             executedClosePrice -
-            position.entryPrice
-          ) * position.quantity
+              position.entryPrice
+          ) *
+          position.quantity *
+          config.contractMultiplier
         : (
             position.entryPrice -
-            executedClosePrice
-          ) * position.quantity;
+              executedClosePrice
+          ) *
+          position.quantity *
+          config.contractMultiplier;
 
     const notionalExit =
       executedClosePrice *
-      position.quantity;
+      position.quantity *
+      config.contractMultiplier;
 
     const commissionClose =
       notionalExit *
@@ -247,30 +360,42 @@ export class PositionService {
       commissionClose;
 
     position.status =
-      request.reason === "stop_loss_hit"
+      request.reason ===
+      "stop_loss_hit"
         ? "stopped"
         : "closed";
 
     position.closePrice =
       executedClosePrice;
 
-    position.closeTime = Date.now();
-    position.grossPnl = grossPnl;
-    position.pnl = pnl;
+    position.closeTime =
+      Date.now();
+
+    position.grossPnl =
+      grossPnl;
+
+    position.pnl =
+      pnl;
+
     position.commissionClose =
       commissionClose;
+
     position.closeReason =
       request.reason || "manual";
 
     this.account.cashBalance +=
-      grossPnl - commissionClose;
+      grossPnl -
+      commissionClose;
 
-    this.account.realizedPnl += pnl;
+    this.account.realizedPnl +=
+      grossPnl -
+      commissionClose;
 
     this.account.totalCommissions +=
       commissionClose;
 
-    this.account.updatedAt = Date.now();
+    this.account.updatedAt =
+      Date.now();
 
     csvLogService.logPositionClosed(
       position
@@ -280,7 +405,10 @@ export class PositionService {
       "position_closed",
       position.symbol,
       `Position closed: ${position.closeReason}`,
-      position
+      {
+        position,
+        account: this.account
+      }
     );
 
     void telegramService.notifyPositionClosed({
@@ -288,18 +416,23 @@ export class PositionService {
       side: position.side,
       quantity: position.quantity,
       entryPrice: position.entryPrice,
-      closePrice: position.closePrice,
+      closePrice:
+        position.closePrice,
       pnl,
       grossPnl,
-      commissionOpen: position.commissionOpen,
+      commissionOpen:
+        position.commissionOpen,
       commissionClose,
-      closeReason: position.closeReason
+      closeReason:
+        position.closeReason
     });
 
     logger.info(
       `Position closed: ${position.symbol}, ` +
-      `reason=${position.closeReason}, ` +
-      `grossPnl=${grossPnl}, pnl=${pnl}`
+        `reason=${position.closeReason}, ` +
+        `grossPnl=${grossPnl}, ` +
+        `pnl=${pnl}, ` +
+        `balance=${this.account.cashBalance}`
     );
 
     return {
@@ -341,12 +474,16 @@ export class PositionService {
       position.side === "long"
         ? (
             currentPrice -
-            position.entryPrice
-          ) * position.quantity
+              position.entryPrice
+          ) *
+          position.quantity *
+          config.contractMultiplier
         : (
             position.entryPrice -
-            currentPrice
-          ) * position.quantity;
+              currentPrice
+          ) *
+          position.quantity *
+          config.contractMultiplier;
 
     let reason:
       | "take_profit_hit"
@@ -359,24 +496,28 @@ export class PositionService {
         currentPrice >=
         position.takeProfitPrice
       ) {
-        reason = "take_profit_hit";
+        reason =
+          "take_profit_hit";
       } else if (
         currentPrice <=
         position.stopLossPrice
       ) {
-        reason = "stop_loss_hit";
+        reason =
+          "stop_loss_hit";
       }
     } else {
       if (
         currentPrice <=
         position.takeProfitPrice
       ) {
-        reason = "take_profit_hit";
+        reason =
+          "take_profit_hit";
       } else if (
         currentPrice >=
         position.stopLossPrice
       ) {
-        reason = "stop_loss_hit";
+        reason =
+          "stop_loss_hit";
       }
     }
 
@@ -421,17 +562,6 @@ export class PositionService {
       closed: Boolean(closed),
       realizedPnl: closed?.pnl
     };
-  }
-
-  reset(): void {
-    this.positions.clear();
-
-    this.account.cashBalance =
-      this.account.initialBalance;
-
-    this.account.realizedPnl = 0;
-    this.account.totalCommissions = 0;
-    this.account.updatedAt = Date.now();
   }
 }
 
