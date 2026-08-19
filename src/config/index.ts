@@ -6,11 +6,16 @@ function parseBoolean(
   value: string | undefined,
   defaultValue: boolean
 ): boolean {
-  if (value === undefined) return defaultValue;
+  if (value === undefined) {
+    return defaultValue;
+  }
 
-  return ["1", "true", "yes", "on"].includes(
-    value.toLowerCase()
-  );
+  return [
+    "1",
+    "true",
+    "yes",
+    "on"
+  ].includes(value.toLowerCase());
 }
 
 function parseNumber(
@@ -24,10 +29,12 @@ function parseNumber(
     : defaultValue;
 }
 
-function parseSymbols(
+function parseInstruments(
   value: string | undefined
 ): string[] {
-  if (!value) return [];
+  if (!value) {
+    return [];
+  }
 
   return value
     .split(",")
@@ -35,10 +42,20 @@ function parseSymbols(
     .filter(Boolean);
 }
 
-export const config = {
-  nodeEnv: process.env.NODE_ENV || "development",
+const instrumentsValue =
+  process.env.INSTRUMENTS ||
+  process.env.SYMBOLS ||
+  "";
 
-  port: parseNumber(process.env.PORT, 3011),
+export const config = {
+  nodeEnv:
+    process.env.NODE_ENV ||
+    "development",
+
+  port: parseNumber(
+    process.env.PORT,
+    3011
+  ),
 
   tradingMode:
     process.env.TRADING_MODE === "live"
@@ -75,11 +92,16 @@ export const config = {
   ),
 
   timeframe:
-    process.env.TIMEFRAME || "1m",
+    process.env.TIMEFRAME ||
+    "1m",
 
-  symbols: parseSymbols(
-    process.env.SYMBOLS
-  ),
+  instruments:
+    parseInstruments(instrumentsValue),
+
+  // Совместимость с текущим BotRunner,
+  // который использует config.symbols.
+  symbols:
+    parseInstruments(instrumentsValue),
 
   botEnabled: parseBoolean(
     process.env.BOT_ENABLED,
@@ -101,28 +123,52 @@ export const config = {
     1000
   ),
 
-  positionTimeStopMinutes: parseNumber(
-    process.env.POSITION_TIME_STOP_MINUTES,
-    16
+  positionTimeStopMinutes:
+    parseNumber(
+      process.env.POSITION_TIME_STOP_MINUTES,
+      16
+    ),
+
+  /*
+   * Фиксированные ограничения стратегии:
+   * стартовый баланс задаётся VIRTUAL_BALANCE,
+   * максимум 3 открытые позиции,
+   * одна позиция — максимум 30%
+   * текущего динамического баланса.
+   */
+  maxOpenPositions: 3,
+  maxPositionNotionalPct: 0.30,
+
+  minPositionSize: parseNumber(
+    process.env.MIN_POSITION_SIZE,
+    1
   ),
 
-  maxOpenPositions: parseNumber(
-    process.env.MAX_OPEN_POSITIONS,
+  positionSizeStep: parseNumber(
+    process.env.POSITION_SIZE_STEP,
+    1
+  ),
+
+  contractMultiplier: parseNumber(
+    process.env.CONTRACT_MULTIPLIER,
     1
   ),
 
   csvDir:
-    process.env.CSV_DIR || "data",
+    process.env.CSV_DIR ||
+    "data",
 
   stateFile:
     process.env.STATE_FILE ||
     "data/bot-state.json",
 
   telegramBotToken:
-    process.env.TELEGRAM_BOT_TOKEN || "",
+    process.env.TELEGRAM_BOT_TOKEN ||
+    "",
 
   telegramChatId:
-    process.env.TELEGRAM_CHAT_ID || "",
+    process.env.TELEGRAM_CHAT_ID ||
+    "",
 
   telegramEnabled: parseBoolean(
     process.env.TELEGRAM_ENABLED,
