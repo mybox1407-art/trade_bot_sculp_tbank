@@ -1,22 +1,62 @@
-import axios from "axios";
+import axios, {
+  AxiosInstance
+} from "axios";
 import config from "../config";
 import logger from "./logger";
 import { Candle } from "../types";
 
-export class TBankClient {
-  private apiKey: string;
-  private baseUrl: string;
-
-  constructor() {
-    this.apiKey = config.tbankApiKey;
-    this.baseUrl = config.tbankApiUrl;
+function quotationToNumber(
+  value: unknown
+): number {
+  if (
+    typeof value === "number"
+  ) {
+    return value;
   }
 
-  private getHeaders() {
-    return {
-      Authorization: `Bearer ${this.apiKey}`,
-      "Content-Type": "application/json",
+  if (
+    typeof value === "string"
+  ) {
+    return Number(value);
+  }
+
+  if (
+    value &&
+    typeof value === "object"
+  ) {
+    const item = value as {
+      units?: number | string;
+      nano?: number;
     };
+
+    const units = Number(
+      item.units || 0
+    );
+
+    const nano = Number(
+      item.nano || 0
+    );
+
+    return units + nano / 1e9;
+  }
+
+  return 0;
+}
+
+export class TBankClient {
+  private readonly api: AxiosInstance;
+
+  constructor() {
+    this.api = axios.create({
+      baseURL: config.tbankApiUrl,
+      timeout: 15000,
+      headers: {
+        Authorization:
+          `Bearer ${config.tbankApiKey}`,
+        "Content-Type":
+          "application/json"
+      }
+    });
   }
 
   async getCandles(
@@ -26,30 +66,103 @@ export class TBankClient {
     interval: "1m" | "5m" = "1m"
   ): Promise<Candle[]> {
     try {
-      const url = `${this.baseUrl}/candles`;
-      const params = { figi, from: from.toISOString(), to: to.toISOString(), interval };
-      const response = await axios.get(url, { headers: this.getHeaders(), params });
-      return response.data.candles.map((c: any) => ({
-        time: new Date(c.time).getTime(),
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-        volume: c.volume,
-      }));
+      const response =
+        await this.api.post(
+          "/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles",
+          {
+            figi,
+            from: from.toISOString(),
+            to: to.toISOString(),
+            interval:
+              interval === "1m"
+                ? "CANDLE_INTERVAL_1_MIN"
+                : "CANDLE_INTERVAL_5_MIN"
+          }
+        );
+
+      const rawCandles =
+        response.data?.candles ||
+        response.data?.items ||
+        [];
+
+      return rawCandles
+        .map((candle: any) => ({
+          time: new Date(
+            candle.time
+          ).getTime(),
+
+          open: quotationToNumber(
+            candle.open
+          ),
+
+          high: quotationToNumber(
+            candle.high
+          ),
+
+          low: quotationToNumber(
+            candle.low
+          ),
+
+          close: quotationToNumber(
+            candle.close
+          ),
+
+          volume: Number(
+            candle.volume || 0
+          )
+        }))
+        .filter(
+          (candle: Candle) =>
+            Number.isFinite(candle.time) &&
+            candle.open > 0 &&
+            candle.high > 0 &&
+            candle.low > 0 &&
+            candle.close > 0
+        )
+        .sort(
+          (a: Candle, b: Candle) =>
+            a.time - b.time
+        );
     } catch (error: any) {
-      logger.error(`Error fetching candles for ${figi}:`, error.response?.data || error.message);
+      logger.error(
+        `Error fetching candles for ${figi}:`,
+        error.response?.data ||
+        error.message
+      );
+
       throw error;
     }
   }
 
-  async getCurrentPrice(figi: string): Promise<number> {
+  async getCurrentPrice(
+    figi: string
+  ): Promise<number> {
     try {
-      const url = `${this.baseUrl}/last_prices`;
-      const response = await axios.get(url, { headers: this.getHeaders(), params: { figi } });
-      return parseFloat(response.data.last_prices[0]?.last_price || "0");
+      const response =
+        await this.api.post(
+          "/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetLastPrices",
+          {
+            figi: [figi]
+          }
+        );
+
+      const prices =
+        response.data?.lastPrices ||
+        response.data?.last_prices ||
+        [];
+
+      return quotationToNumber(
+        prices[0]?.price ||
+        prices[0]?.lastPrice ||
+        prices[0]?.last_price
+      );
     } catch (error: any) {
-      logger.error(`Error fetching price for ${figi}:`, error.response?.data || error.message);
+      logger.error(
+        `Error fetching price for ${figi}:`,
+        error.response?.data ||
+        error.message
+      );
+
       throw error;
     }
   }
@@ -60,42 +173,129 @@ export class TBankClient {
     quantity: number,
     orderType: "Limit" | "Market" = "Market"
   ): Promise<string> {
-    try {
-      const url = `${this.baseUrl}/orders`;
-      const response = await axios.post(
-        url,
-        { figi, operation: side, quantity, type: orderType },
-        { headers: this.getHeaders() }
+    if (
+      config.tradingMode !== "live"
+    ) {
+      throw new Error(
+        "Live order rejected: TRADING_MODE is not live"
       );
-      return response.data.order_id;
+    }
+
+    try {
+      const response =
+        await this.api.post(
+          "/rest/tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder",
+          {
+            figi,
+            quantity: String(quantity),
+            direction:
+              side === "Buy"
+                ? "ORDER_DIRECTION_BUY"
+                : "ORDER_DIRECTION_SELL",
+            orderType:
+              orderType === "Market"
+                ? "ORDER_TYPE_MARKET"
+                : "ORDER_TYPE_LIMIT",
+            accountId:
+              config.tbankAccountId
+          }
+        );
+
+      return String(
+        response.data?.orderId ||
+        response.data?.order_id ||
+        ""
+      );
     } catch (error: any) {
-      logger.error(`Error opening position for ${figi}:`, error.response?.data || error.message);
+      logger.error(
+        `Error opening position for ${figi}:`,
+        error.response?.data ||
+        error.message
+      );
+
       throw error;
     }
   }
 
-  async closePosition(figi: string, side: "Buy" | "Sell", quantity: number): Promise<string> {
-    const oppositeSide = side === "Buy" ? "Sell" : "Buy";
-    return await this.openPosition(figi, oppositeSide, quantity, "Market");
+  async closePosition(
+    figi: string,
+    side: "Buy" | "Sell",
+    quantity: number
+  ): Promise<string> {
+    const oppositeSide =
+      side === "Buy"
+        ? "Sell"
+        : "Buy";
+
+    return this.openPosition(
+      figi,
+      oppositeSide,
+      quantity,
+      "Market"
+    );
   }
 
-  async getPositions(): Promise<Array<{ figi: string; quantity: number; averagePositionPrice: number; currentPrice: number; dailyYield: number }>> {
+  async getPositions(): Promise<
+    Array<{
+      figi: string;
+      quantity: number;
+      averagePositionPrice: number;
+      currentPrice: number;
+      dailyYield: number;
+    }>
+  > {
+    if (
+      config.tradingMode !== "live"
+    ) {
+      return [];
+    }
+
     try {
-      const url = `${this.baseUrl}/portfolio`;
-      const response = await axios.get(url, { headers: this.getHeaders() });
-      return response.data.positions.map((p: any) => ({
-        figi: p.figi,
-        quantity: p.quantity,
-        averagePositionPrice: parseFloat(p.averagePositionPrice),
-        currentPrice: parseFloat(p.currentPrice),
-        dailyYield: parseFloat(p.dailyYield),
-      }));
+      const response =
+        await this.api.post(
+          "/rest/tinkoff.public.invest.api.contract.v1.OperationsService/GetPortfolio",
+          {
+            accountId:
+              config.tbankAccountId
+          }
+        );
+
+      const positions =
+        response.data?.positions || [];
+
+      return positions.map(
+        (position: any) => ({
+          figi: position.figi,
+          quantity: Number(
+            position.quantity || 0
+          ),
+          averagePositionPrice:
+            quotationToNumber(
+              position.averagePositionPrice
+            ),
+          currentPrice:
+            quotationToNumber(
+              position.currentPrice
+            ),
+          dailyYield:
+            quotationToNumber(
+              position.dailyYield
+            )
+        })
+      );
     } catch (error: any) {
-      logger.error("Error fetching positions:", error.response?.data || error.message);
+      logger.error(
+        "Error fetching positions:",
+        error.response?.data ||
+        error.message
+      );
+
       throw error;
     }
   }
 }
 
-export const tbankClient = new TBankClient();
+export const tbankClient =
+  new TBankClient();
+
 export default tbankClient;
