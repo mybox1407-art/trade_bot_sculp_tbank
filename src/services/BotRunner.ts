@@ -1,7 +1,5 @@
 import config from "../config";
 import {
-  BarIndicators1m,
-  BarIndicators5m,
   Candle,
   EntryDecision,
   ScalpParams,
@@ -12,7 +10,7 @@ import positionService from "./PositionService";
 import csvLogService from "./CsvLogService";
 import telegramService from "./TelegramService";
 import { ScalpStrategy } from "./ScalpStrategy";
-import { logger } from "../utils";
+import logger from "../utils/logger";
 
 export interface BotRunnerStatus {
   running: boolean;
@@ -65,7 +63,8 @@ export class BotRunner {
 
     if (this.symbols.length === 0) {
       throw new Error(
-        "No symbols configured"
+        "No instruments configured. " +
+          "Set INSTRUMENTS or SYMBOLS in .env"
       );
     }
 
@@ -74,8 +73,8 @@ export class BotRunner {
     this.lastError = null;
 
     logger.info(
-      `BotRunner started for symbols: ` +
-      `${this.symbols.join(", ")}`
+      `BotRunner started for instruments: ` +
+        `${this.symbols.join(", ")}`
     );
 
     csvLogService.logEvent(
@@ -83,16 +82,19 @@ export class BotRunner {
       "",
       "Autonomous bot started",
       {
-        symbols: this.symbols,
-        mode: config.tradingMode
+        instruments: this.symbols,
+        mode: config.tradingMode,
+        initialBalance:
+          config.virtualBalance,
+        maxOpenPositions:
+          config.maxOpenPositions,
+        maxPositionNotionalPct:
+          config.maxPositionNotionalPct
       }
     );
 
-    void telegramService.sendMessage(
-      `🤖 <b>Бот запущен</b>\n\n` +
-      `<b>Режим:</b> ${config.tradingMode}\n` +
-      `<b>Инструменты:</b> ` +
-      `${this.symbols.join(", ")}`
+    void telegramService.notifyBotStarted(
+      this.symbols
     );
 
     this.timer = setInterval(
@@ -106,7 +108,9 @@ export class BotRunner {
   }
 
   async stop(): Promise<void> {
-    if (!this.running) return;
+    if (!this.running) {
+      return;
+    }
 
     this.running = false;
 
@@ -121,9 +125,7 @@ export class BotRunner {
       "Autonomous bot stopped"
     );
 
-    await telegramService.sendMessage(
-      "🛑 <b>Бот остановлен</b>"
-    );
+    await telegramService.notifyBotStopped();
 
     logger.info(
       "BotRunner stopped"
@@ -148,13 +150,17 @@ export class BotRunner {
         positionService
           .getOpenPositions()
           .length,
-      cashBalance: account.cashBalance,
-      realizedPnl: account.realizedPnl
+      cashBalance:
+        account.cashBalance,
+      realizedPnl:
+        account.realizedPnl
     };
   }
 
   private async runCycle(): Promise<void> {
-    if (!this.running) return;
+    if (!this.running) {
+      return;
+    }
 
     if (this.cycleInProgress) {
       logger.warn(
@@ -169,7 +175,9 @@ export class BotRunner {
 
     try {
       for (const symbol of this.symbols) {
-        if (!this.running) break;
+        if (!this.running) {
+          break;
+        }
 
         try {
           await this.processSymbol(
@@ -193,7 +201,7 @@ export class BotRunner {
           );
 
           await telegramService.notifyError(
-            `processing ${symbol}`,
+            `Обработка ${symbol}`,
             error
           );
         }
@@ -212,7 +220,9 @@ export class BotRunner {
       );
 
     const existingPosition =
-      positionService.getPosition(symbol);
+      positionService.getPosition(
+        symbol
+      );
 
     if (
       existingPosition &&
@@ -226,10 +236,25 @@ export class BotRunner {
       return;
     }
 
+    const openPositions =
+      positionService.getOpenPositions();
+
     if (
-      positionService.getOpenPositions()
-        .length >= config.maxOpenPositions
+      openPositions.length >=
+      config.maxOpenPositions
     ) {
+      csvLogService.logEvent(
+        "position_limit",
+        symbol,
+        "Maximum open positions reached",
+        {
+          currentOpenPositions:
+            openPositions.length,
+          maxOpenPositions:
+            config.maxOpenPositions
+        }
+      );
+
       return;
     }
 
@@ -258,7 +283,9 @@ export class BotRunner {
     }
 
     const latestCandle =
-      candles1m[candles1m.length - 1];
+      candles1m[
+        candles1m.length - 1
+      ];
 
     if (
       this.isCandleAlreadyProcessed(
@@ -287,7 +314,8 @@ export class BotRunner {
       csvLogService.logEvent(
         "signal_rejected",
         symbol,
-        decision.reason || "no_signal",
+        decision.reason ||
+          "no_signal",
         decision
       );
 
@@ -310,11 +338,26 @@ export class BotRunner {
       return;
     }
 
-    const quantity =
+    const availableBalance =
+      positionService
+        .getAvailableBalance();
+
+    const calculatedQuantity =
       this.strategy.calculatePositionSize(
         decision.signal.entryPrice,
-        decision.signal.stopLossPrice
+        decision.signal.stopLossPrice,
+        availableBalance
       );
+
+    const maxQuantity =
+      positionService.calculateMaxQuantity(
+        decision.signal.entryPrice
+      );
+
+    const quantity = Math.min(
+      calculatedQuantity,
+      maxQuantity
+    );
 
     if (
       !Number.isFinite(quantity) ||
@@ -323,7 +366,15 @@ export class BotRunner {
       csvLogService.logEvent(
         "position_size_zero",
         symbol,
-        "Calculated quantity is zero"
+        "Position size is zero after risk and balance limits",
+        {
+          calculatedQuantity,
+          maxQuantity,
+          availableBalance,
+          currentPositionLimit:
+            positionService
+              .getCurrentPositionLimit()
+        }
       );
 
       return;
@@ -334,7 +385,8 @@ export class BotRunner {
         symbol,
         side: decision.signal.side,
         quantity,
-        entryPrice: decision.signal.entryPrice,
+        entryPrice:
+          decision.signal.entryPrice,
         stopLossPrice:
           decision.signal.stopLossPrice,
         takeProfitPrice:
@@ -354,7 +406,11 @@ export class BotRunner {
       {
         decision,
         quantity,
-        position
+        position,
+        availableBalance,
+        currentPositionLimit:
+          positionService
+            .getCurrentPositionLimit()
       }
     );
   }
@@ -373,6 +429,11 @@ export class BotRunner {
         candles5m
       );
 
+    /*
+     * Последняя свеча считается текущей.
+     * Сигнал строится по предпоследней
+     * закрытой свече.
+     */
     const signalIndex =
       candles1m.length - 2;
 
@@ -402,11 +463,16 @@ export class BotRunner {
     signal: ScalpSignal
   ): boolean {
     const lastSignal =
-      this.lastSignalCandle.get(symbol);
+      this.lastSignalCandle.get(
+        symbol
+      );
 
-    if (!lastSignal) return false;
+    if (!lastSignal) {
+      return false;
+    }
 
-    const timeframeMs = 60 * 1000;
+    const timeframeMs =
+      60 * 1000;
 
     return (
       signal.signalTime - lastSignal <
@@ -423,3 +489,5 @@ export class BotRunner {
     );
   }
 }
+
+export default BotRunner;
