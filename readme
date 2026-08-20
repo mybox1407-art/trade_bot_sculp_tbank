@@ -4,6 +4,19 @@ cd ~
 rm -rf trade_bot_sculp_tbank
 git clone https://github.com/mybox1407-art/trade_bot_sculp_tbank.git
 cd trade_bot_sculp_tbank
+
+openssl x509 \
+  -in certs/russian_trusted_root_ca.pem \
+  -noout \
+  -subject \
+  -issuer
+
+openssl x509 \
+  -in certs/russian_trusted_sub_ca.pem \
+  -noout \
+  -subject \
+  -issuer
+
 npm install
 docker compose up -d --build
 
