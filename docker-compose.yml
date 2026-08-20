@@ -8,7 +8,7 @@ services:
     env_file:
       - .env
     ports:
-      - "3011:3011"
+      - "3012:3011"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
