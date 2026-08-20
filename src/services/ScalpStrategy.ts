@@ -44,6 +44,7 @@ export interface ScalpParams {
 
   trendAtrLookback5m: number;
   trendAtrExpandRatio5m: number;
+  atrExpansionTolerance5m: number;
 
   pullbackLookback1m: number;
   breakoutBufferPct: number;
@@ -70,16 +71,7 @@ export interface ScalpParams {
   sessionTimezone?: "UTC";
   contractMultiplier?: number;
 
-  /**
-   * Минимальный размер позиции.
-   * Для акций обычно 1 лот или больше.
-   */
   minPositionSize?: number;
-
-  /**
-   * Шаг количества.
-   * Для акций может быть 1.
-   */
   positionSizeStep?: number;
 }
 
@@ -121,6 +113,10 @@ export interface EntryDecision {
   accepted: boolean;
   reason?: EntryRejectReason;
   signal?: ScalpSignal;
+  diagnostics?: Record<
+    string,
+    number | boolean | null
+  >;
 }
 
 export interface BarIndicators1m {
@@ -198,7 +194,12 @@ export const DEFAULT_SCALP_PARAMS: ScalpParams = {
   volumeLookback1m: 60,
 
   trendAtrLookback5m: 20,
-  trendAtrExpandRatio5m: 1.1,
+
+  // Средний режим ATR
+  trendAtrExpandRatio5m: 1.05,
+
+  // Допускаем снижение ATR не более чем на 0.5%
+  atrExpansionTolerance5m: 0.995,
 
   pullbackLookback1m: 6,
   breakoutBufferPct: 0.00015,
@@ -240,17 +241,6 @@ function isFinitePositive(
   );
 }
 
-function isFiniteNonNegative(
-  value: number | null | undefined
-): value is number {
-  return (
-    value !== null &&
-    value !== undefined &&
-    Number.isFinite(value) &&
-    value >= 0
-  );
-}
-
 function validateCandle(
   candle: Candle
 ): boolean {
@@ -262,6 +252,7 @@ function validateCandle(
     Number.isFinite(candle.close) &&
     Number.isFinite(candle.volume) &&
     candle.open > 0 &&
+    candle.close > 0 &&
     candle.high >= candle.low &&
     candle.high >= candle.open &&
     candle.high >= candle.close &&
@@ -301,7 +292,8 @@ function padSeries(
     totalLength - values.length;
 
   for (let i = 0; i < values.length; i++) {
-    const targetIndex = firstIndex + i;
+    const targetIndex =
+      firstIndex + i;
 
     if (
       targetIndex >= 0 &&
@@ -341,21 +333,16 @@ function mergeBucket(
   bucketStart: number
 ): Candle {
   const first = bucket[0];
-  const last = bucket[bucket.length - 1];
+  const last =
+    bucket[bucket.length - 1];
 
   let high = first.high;
   let low = first.low;
   let volume = 0;
 
   for (const candle of bucket) {
-    if (candle.high > high) {
-      high = candle.high;
-    }
-
-    if (candle.low < low) {
-      low = candle.low;
-    }
-
+    high = Math.max(high, candle.high);
+    low = Math.min(low, candle.low);
     volume += candle.volume;
   }
 
@@ -381,7 +368,9 @@ function isComplete5mBucket(
     const expectedTime =
       bucketStart + i * 60 * 1000;
 
-    if (bucket[i].time !== expectedTime) {
+    if (
+      bucket[i].time !== expectedTime
+    ) {
       return false;
     }
   }
@@ -395,11 +384,10 @@ export function aggregateCandlesTo5m(
 ): Candle[] {
   const result: Candle[] = [];
 
-  if (candles.length === 0) {
-    return result;
-  }
-
-  if (!validateCandles(candles)) {
+  if (
+    candles.length === 0 ||
+    !validateCandles(candles)
+  ) {
     return result;
   }
 
@@ -432,7 +420,8 @@ export function aggregateCandlesTo5m(
   for (const candle of candles) {
     const bucketStart =
       Math.floor(
-        candle.time / (5 * 60 * 1000)
+        candle.time /
+          (5 * 60 * 1000)
       ) *
       (5 * 60 * 1000);
 
@@ -456,7 +445,8 @@ export function aggregateCandlesTo5m(
 
 export function build1mIndicators(
   candles: Candle[],
-  params: ScalpParams = DEFAULT_SCALP_PARAMS
+  params: ScalpParams =
+    DEFAULT_SCALP_PARAMS
 ): BarIndicators1m[] {
   if (!validateCandles(candles)) {
     return candles.map(() => ({
@@ -491,10 +481,11 @@ export function build1mIndicators(
     candles.length
   );
 
-  const volumeSmaSeries = padSeries(
-    volumeSmaRaw,
-    candles.length
-  );
+  const volumeSmaSeries =
+    padSeries(
+      volumeSmaRaw,
+      candles.length
+    );
 
   const typicalPrices = candles.map(
     candle =>
@@ -548,7 +539,8 @@ export function build1mIndicators(
 
 export function build5mIndicators(
   candles5m: Candle[],
-  params: ScalpParams = DEFAULT_SCALP_PARAMS
+  params: ScalpParams =
+    DEFAULT_SCALP_PARAMS
 ): BarIndicators5m[] {
   if (!validateCandles(candles5m)) {
     return candles5m.map(() => ({
@@ -605,13 +597,6 @@ export function build5mIndicators(
     candles5m.length
   );
 
-  /**
-   * ATR.calculate() возвращает первое
-   * значение после накопления atrPeriod баров.
-   *
-   * SMA по ATR получает первое значение
-   * после trendAtrLookback значений ATR.
-   */
   const atrSmaFirstIndex =
     params.atrPeriod5m +
     params.trendAtrLookback5m -
@@ -627,7 +612,8 @@ export function build5mIndicators(
   return candles5m.map(
     (_candle, index) => ({
       atr5m: atrSeries[index],
-      atr5mSma: atrSmaSeries[index],
+      atr5mSma:
+        atrSmaSeries[index],
       emaFast5m:
         emaFastSeries[index],
       emaSlow5m:
@@ -635,43 +621,6 @@ export function build5mIndicators(
       close5m: closes[index]
     })
   );
-}
-
-export function map1mIndexTo5mIndex(
-  candleTime: number,
-  candles5m: Candle[]
-): number {
-  if (candles5m.length === 0) {
-    return -1;
-  }
-
-  const bucketStart =
-    Math.floor(
-      candleTime / (5 * 60 * 1000)
-    ) *
-    (5 * 60 * 1000);
-
-  let left = 0;
-  let right = candles5m.length - 1;
-  let answer = -1;
-
-  while (left <= right) {
-    const middle = Math.floor(
-      (left + right) / 2
-    );
-
-    if (
-      candles5m[middle].time <=
-      bucketStart
-    ) {
-      answer = middle;
-      left = middle + 1;
-    } else {
-      right = middle - 1;
-    }
-  }
-
-  return answer;
 }
 
 export function map1mIndexToClosed5mIndex(
@@ -684,14 +633,11 @@ export function map1mIndexToClosed5mIndex(
 
   const currentBucketStart =
     Math.floor(
-      candleTime / (5 * 60 * 1000)
+      candleTime /
+        (5 * 60 * 1000)
     ) *
     (5 * 60 * 1000);
 
-  /**
-   * 5m-свеча текущего bucket ещё не закрыта.
-   * Поэтому используется предыдущий bucket.
-   */
   const lastClosedBucketStart =
     currentBucketStart -
     5 * 60 * 1000;
@@ -701,9 +647,10 @@ export function map1mIndexToClosed5mIndex(
   let answer = -1;
 
   while (left <= right) {
-    const middle = Math.floor(
-      (left + right) / 2
-    );
+    const middle =
+      Math.floor(
+        (left + right) / 2
+      );
 
     if (
       candles5m[middle].time <=
@@ -824,9 +771,10 @@ function highestHigh(
     );
     index++
   ) {
-    if (candles[index].high > high) {
-      high = candles[index].high;
-    }
+    high = Math.max(
+      high,
+      candles[index].high
+    );
   }
 
   return high;
@@ -852,9 +800,10 @@ function lowestLow(
     );
     index++
   ) {
-    if (candles[index].low < low) {
-      low = candles[index].low;
-    }
+    low = Math.min(
+      low,
+      candles[index].low
+    );
   }
 
   return low;
@@ -983,6 +932,16 @@ function assertValidParams(
   }
 
   if (
+    params.trendAtrExpandRatio5m <= 0 ||
+    params.atrExpansionTolerance5m <= 0 ||
+    params.atrExpansionTolerance5m > 1
+  ) {
+    throw new Error(
+      "ATR expansion parameters are invalid"
+    );
+  }
+
+  if (
     params.minCloseLocationLong < 0 ||
     params.minCloseLocationLong > 1 ||
     params.maxCloseLocationShort < 0 ||
@@ -1054,10 +1013,11 @@ export function calculatePositionSize(
     return 0;
   }
 
-  const riskFraction = Math.min(
-    Math.max(0, riskPerTrade),
-    Math.max(0, maxRiskPerTrade)
-  );
+  const riskFraction =
+    Math.min(
+      Math.max(0, riskPerTrade),
+      Math.max(0, maxRiskPerTrade)
+    );
 
   const riskBudget =
     equity * riskFraction;
@@ -1084,7 +1044,8 @@ export function calculatePositionSize(
   }
 
   const sizeByRisk =
-    riskBudget / totalRiskPerUnit;
+    riskBudget /
+    totalRiskPerUnit;
 
   const maxNotional =
     equity *
@@ -1095,12 +1056,16 @@ export function calculatePositionSize(
 
   const sizeByNotional =
     maxNotional /
-    (entryPrice * contractMultiplier);
+    (
+      entryPrice *
+      contractMultiplier
+    );
 
-  const rawSize = Math.min(
-    sizeByRisk,
-    sizeByNotional
-  );
+  const rawSize =
+    Math.min(
+      sizeByRisk,
+      sizeByNotional
+    );
 
   if (
     rawSize < minPositionSize
@@ -1152,7 +1117,8 @@ function hasEnoughTargetAfterCosts(
   return (
     targetMovePct >=
       params.minTargetMovePct &&
-    targetMovePct >= minimumByCost
+    targetMovePct >=
+      minimumByCost
   );
 }
 
@@ -1193,6 +1159,12 @@ function createLongSignal(
       breakoutLevel
     );
 
+  if (
+    rawEntryPrice > entryCandle.high
+  ) {
+    return null;
+  }
+
   const entryPrice =
     rawEntryPrice *
     (1 + params.slippageRate);
@@ -1231,25 +1203,40 @@ function createLongSignal(
     signalIndex,
     entryIndex,
 
-    signalTime: signalCandle.time,
-    entryTime: entryCandle.time,
+    signalTime:
+      signalCandle.time,
+
+    entryTime:
+      entryCandle.time,
 
     rawEntryPrice,
-    triggerPrice: breakoutLevel,
+    triggerPrice:
+      breakoutLevel,
+
     entryPrice,
 
     stopLossPrice,
     takeProfitPrice,
 
-    riskDistance: stopDistance,
+    riskDistance:
+      stopDistance,
 
-    atr1m: ind1m.atr1m,
-    atr5m: ctx5m.atr5m,
-    vwap1m: ind1m.vwap1m,
+    atr1m:
+      ind1m.atr1m,
 
-    impulseBodyPct: bodyPct,
+    atr5m:
+      ctx5m.atr5m,
+
+    vwap1m:
+      ind1m.vwap1m,
+
+    impulseBodyPct:
+      bodyPct,
+
     closeLocation,
+
     pullbackPct,
+
     volumeRatio,
 
     entryCommissionPct:
@@ -1307,6 +1294,12 @@ function createShortSignal(
       breakoutLevel
     );
 
+  if (
+    rawEntryPrice < entryCandle.low
+  ) {
+    return null;
+  }
+
   const entryPrice =
     rawEntryPrice *
     (1 - params.slippageRate);
@@ -1324,7 +1317,8 @@ function createShortSignal(
     params.atrTpMult;
 
   const targetMovePct =
-    (entryPrice - takeProfitPrice) /
+    (entryPrice -
+      takeProfitPrice) /
     entryPrice;
 
   if (
@@ -1345,25 +1339,40 @@ function createShortSignal(
     signalIndex,
     entryIndex,
 
-    signalTime: signalCandle.time,
-    entryTime: entryCandle.time,
+    signalTime:
+      signalCandle.time,
+
+    entryTime:
+      entryCandle.time,
 
     rawEntryPrice,
-    triggerPrice: breakoutLevel,
+    triggerPrice:
+      breakoutLevel,
+
     entryPrice,
 
     stopLossPrice,
     takeProfitPrice,
 
-    riskDistance: stopDistance,
+    riskDistance:
+      stopDistance,
 
-    atr1m: ind1m.atr1m,
-    atr5m: ctx5m.atr5m,
-    vwap1m: ind1m.vwap1m,
+    atr1m:
+      ind1m.atr1m,
 
-    impulseBodyPct: bodyPct,
+    atr5m:
+      ctx5m.atr5m,
+
+    vwap1m:
+      ind1m.vwap1m,
+
+    impulseBodyPct:
+      bodyPct,
+
     closeLocation,
+
     pullbackPct,
+
     volumeRatio,
 
     entryCommissionPct:
@@ -1390,7 +1399,8 @@ export function evaluateMomentumScalpEntry(
   candles5m: Candle[],
   indicators5m: BarIndicators5m[],
   signalIndex: number,
-  params: ScalpParams = DEFAULT_SCALP_PARAMS
+  params: ScalpParams =
+    DEFAULT_SCALP_PARAMS
 ): EntryDecision {
   assertValidParams(params);
 
@@ -1501,20 +1511,48 @@ export function evaluateMomentumScalpEntry(
     Number.isFinite(previousAtr) &&
     Number(previousAtr) > 0;
 
-  const atrExpanding =
+  const atrSmaThreshold =
+    ctx5m.atr5mSma *
+    params.trendAtrExpandRatio5m;
+
+  const previousAtrThreshold =
+    atrHasPreviousValue
+      ? Number(previousAtr) *
+        params.atrExpansionTolerance5m
+      : null;
+
+  const atrAboveAverage =
     ctx5m.atr5m >=
-      ctx5m.atr5mSma *
-        params.trendAtrExpandRatio5m &&
-    (
-      !atrHasPreviousValue ||
-      ctx5m.atr5m >=
-        Number(previousAtr)
-    );
+    atrSmaThreshold;
+
+  const atrNotContracting =
+    !atrHasPreviousValue ||
+    ctx5m.atr5m >=
+      Number(previousAtrThreshold);
+
+  const atrExpanding =
+    atrAboveAverage &&
+    atrNotContracting;
 
   if (!atrExpanding) {
     return {
       accepted: false,
-      reason: "atr_not_expanding"
+      reason: "atr_not_expanding",
+      diagnostics: {
+        currentAtr: ctx5m.atr5m,
+        atrSma: ctx5m.atr5mSma,
+        previousAtr: atrHasPreviousValue
+          ? Number(previousAtr)
+          : null,
+        atrSmaThreshold,
+        previousAtrThreshold,
+        atrAboveAverage,
+        atrNotContracting,
+        trendAtrExpandRatio5m:
+          params.trendAtrExpandRatio5m,
+        atrExpansionTolerance5m:
+          params.atrExpansionTolerance5m
+      }
     };
   }
 
@@ -1862,8 +1900,7 @@ export class ScalpStrategy {
         this.params.maxRiskPerTrade,
 
       maxPositionNotionalPct:
-        this.params
-          .maxPositionNotionalPct,
+        this.params.maxPositionNotionalPct,
 
       commissionRate:
         this.params.commissionRate,
@@ -2000,6 +2037,7 @@ export class ScalpStrategy {
     }
 
     const candles1m = candles;
+
     const candles5m =
       aggregateCandlesTo5m(
         candles1m,
@@ -2056,35 +2094,53 @@ export class ScalpStrategy {
 
     return {
       ready: true,
+
       buy:
         Boolean(signal) &&
-        signal?.side === "long",
+        signal.side === "long",
+
       sell:
         Boolean(signal) &&
-        signal?.side === "short",
+        signal.side === "short",
+
       side:
         signal?.side || "none",
-      regime: regime.regime,
+
+      regime:
+        regime.regime,
+
       positionSize,
+
       takeProfitPrice:
         signal?.takeProfitPrice,
+
       stopLossPrice:
         signal?.stopLossPrice,
+
       signal,
-      reason: decision.reason,
+
+      reason:
+        decision.reason,
+
       indicators: {
         atr1m:
           last1m?.atr1m ?? null,
+
         atr5m:
           last5m?.atr5m ?? null,
+
         vwap1m:
           last1m?.vwap1m ?? null,
+
         emaFast5m:
           last5m?.emaFast5m ?? null,
+
         emaSlow5m:
           last5m?.emaSlow5m ?? null,
+
         lastAtr:
           last1m?.atr1m ?? null,
+
         ready:
           Boolean(
             last1m?.atr1m &&
