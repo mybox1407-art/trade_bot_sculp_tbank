@@ -9,7 +9,9 @@ export interface Candle {
 
 export type ScalpSide = "long" | "short";
 
-export type TradingMode = "paper" | "live";
+export type TradingMode =
+  | "paper"
+  | "live";
 
 export type PositionStatus =
   | "open"
@@ -48,6 +50,16 @@ export interface ScalpParams {
   trendAtrLookback5m: number;
   trendAtrExpandRatio5m: number;
 
+  /**
+   * Допустимое относительное снижение
+   * ATR относительно предыдущего значения.
+   *
+   * Например, 0.995 означает, что ATR
+   * может быть ниже предыдущего максимум
+   * на 0.5%.
+   */
+  atrExpansionTolerance5m: number;
+
   pullbackLookback1m: number;
   breakoutBufferPct: number;
   minPullbackPct: number;
@@ -72,6 +84,18 @@ export interface ScalpParams {
 
   sessionTimezone?: "UTC";
   contractMultiplier?: number;
+
+  /**
+   * Минимальный размер позиции.
+   * Для акций обычно 1 лот или больше.
+   */
+  minPositionSize?: number;
+
+  /**
+   * Шаг количества.
+   * Для акций может быть 1.
+   */
+  positionSizeStep?: number;
 }
 
 export interface ScalpSignal {
@@ -112,6 +136,15 @@ export interface EntryDecision {
   accepted: boolean;
   reason?: EntryRejectReason;
   signal?: ScalpSignal;
+
+  /**
+   * Диагностические значения фильтров.
+   * Например, ATR, SMA ATR и пороги ATR.
+   */
+  diagnostics?: Record<
+    string,
+    number | boolean | null
+  >;
 }
 
 export interface BarIndicators1m {
@@ -175,8 +208,17 @@ export interface AccountState {
 export interface BotState {
   account: AccountState;
   positions: Position[];
-  lastSignalBySymbol: Record<string, number>;
-  lastProcessedCandleBySymbol: Record<string, number>;
+
+  lastSignalBySymbol: Record<
+    string,
+    number
+  >;
+
+  lastProcessedCandleBySymbol: Record<
+    string,
+    number
+  >;
+
   updatedAt: number;
 }
 
@@ -184,6 +226,7 @@ export interface SignalResponse {
   symbol: string;
   signal: ScalpSignal | null;
   reason?: EntryRejectReason;
+
   indicators: {
     atr1m: number | null;
     atr5m: number | null;
@@ -191,6 +234,7 @@ export interface SignalResponse {
     emaFast5m: number | null;
     emaSlow5m: number | null;
   };
+
   candlesCount: number;
   timestamp: number;
 }
@@ -208,6 +252,7 @@ export interface OpenPositionRequest {
 export interface ClosePositionRequest {
   symbol: string;
   closePrice: number;
+
   reason?:
     | "take_profit_hit"
     | "stop_loss_hit"
