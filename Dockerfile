@@ -2,6 +2,12 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
+# Корневые сертификаты и инструменты для проверки TLS
+RUN apk add --no-cache \
+    ca-certificates \
+    openssl \
+    && update-ca-certificates
+
 COPY package*.json ./
 
 RUN npm ci
@@ -18,10 +24,16 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
+# CA-сертификаты обязательны для HTTPS-запросов из Node.js
+RUN apk add --no-cache \
+    ca-certificates \
+    openssl \
+    && update-ca-certificates
+
 COPY package*.json ./
 
 RUN npm ci --omit=dev \
-  && npm cache clean --force
+    && npm cache clean --force
 
 COPY --from=builder /app/dist ./dist
 
