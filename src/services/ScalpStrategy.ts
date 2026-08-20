@@ -194,11 +194,7 @@ export const DEFAULT_SCALP_PARAMS: ScalpParams = {
   volumeLookback1m: 60,
 
   trendAtrLookback5m: 20,
-
-  // Средний режим ATR
   trendAtrExpandRatio5m: 1.05,
-
-  // Допускаем снижение ATR не более чем на 0.5%
   atrExpansionTolerance5m: 0.995,
 
   pullbackLookback1m: 6,
@@ -1718,7 +1714,7 @@ export function evaluateMomentumScalpEntry(
       };
     }
 
-    const signal =
+    const longSignal =
       createLongSignal(
         candles1m,
         indicators1m,
@@ -1734,7 +1730,7 @@ export function evaluateMomentumScalpEntry(
         longBreakoutLevel
       );
 
-    if (!signal) {
+    if (!longSignal) {
       return {
         accepted: false,
         reason:
@@ -1744,7 +1740,7 @@ export function evaluateMomentumScalpEntry(
 
     return {
       accepted: true,
-      signal
+      signal: longSignal
     };
   }
 
@@ -1786,7 +1782,7 @@ export function evaluateMomentumScalpEntry(
       };
     }
 
-    const signal =
+    const shortSignal =
       createShortSignal(
         candles1m,
         indicators1m,
@@ -1802,7 +1798,7 @@ export function evaluateMomentumScalpEntry(
         shortBreakoutLevel
       );
 
-    if (!signal) {
+    if (!shortSignal) {
       return {
         accepted: false,
         reason:
@@ -1812,7 +1808,7 @@ export function evaluateMomentumScalpEntry(
 
     return {
       accepted: true,
-      signal
+      signal: shortSignal
     };
   }
 
@@ -1961,11 +1957,10 @@ export class ScalpStrategy {
         candles5m
       );
 
-    const index =
-      indicators5m.length - 1;
-
     const current =
-      indicators5m[index];
+      indicators5m[
+        indicators5m.length - 1
+      ];
 
     if (
       !isFinitePositive(
@@ -2036,7 +2031,8 @@ export class ScalpStrategy {
       };
     }
 
-    const candles1m = candles;
+    const candles1m =
+      candles;
 
     const candles5m =
       aggregateCandlesTo5m(
@@ -2066,8 +2062,15 @@ export class ScalpStrategy {
         signalIndex
       );
 
+    /*
+     * Важно:
+     * здесь signal имеет тип
+     * ScalpSignal | undefined.
+     *
+     * Не используем signal.side напрямую.
+     */
     const signal =
-      decision.signal || null;
+      decision.signal;
 
     const regime =
       this.determineRegime(
@@ -2096,12 +2099,10 @@ export class ScalpStrategy {
       ready: true,
 
       buy:
-        Boolean(signal) &&
-        signal.side === "long",
+        signal?.side === "long",
 
       sell:
-        Boolean(signal) &&
-        signal.side === "short",
+        signal?.side === "short",
 
       side:
         signal?.side || "none",
@@ -2117,7 +2118,8 @@ export class ScalpStrategy {
       stopLossPrice:
         signal?.stopLossPrice,
 
-      signal,
+      signal:
+        signal || null,
 
       reason:
         decision.reason,
