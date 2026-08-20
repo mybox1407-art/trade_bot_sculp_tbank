@@ -3,15 +3,21 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+
     container_name: moex-scalp-live
+
     restart: unless-stopped
+
     env_file:
       - .env
+
     ports:
       - "3012:3011"
+
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+
     healthcheck:
       test:
         [
