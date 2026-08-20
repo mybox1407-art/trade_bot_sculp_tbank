@@ -93,18 +93,30 @@ export class BotRunner {
       }
     );
 
-    void telegramService.notifyBotStarted(
-      this.symbols
-    );
+    void telegramService
+      .notifyBotStarted(this.symbols)
+      .catch((error) => {
+        logger.error(
+          "Failed to send bot started notification:",
+          error
+        );
+      });
 
-    this.timer = setInterval(
-      () => {
-        void this.runCycle();
-      },
-      config.pollIntervalMs
-    );
+    this.timer = setInterval(() => {
+      void this.runCycle().catch((error) => {
+        this.handleCycleError(
+          "Scheduled bot cycle failed",
+          error
+        );
+      });
+    }, config.pollIntervalMs);
 
-    void this.runCycle();
+    void this.runCycle().catch((error) => {
+      this.handleCycleError(
+        "Initial bot cycle failed",
+        error
+      );
+    });
   }
 
   async stop(): Promise<void> {
@@ -125,7 +137,14 @@ export class BotRunner {
       "Autonomous bot stopped"
     );
 
-    await telegramService.notifyBotStopped();
+    try {
+      await telegramService.notifyBotStopped();
+    } catch (error) {
+      logger.error(
+        "Failed to send bot stopped notification:",
+        error
+      );
+    }
 
     logger.info(
       "BotRunner stopped"
@@ -185,9 +204,7 @@ export class BotRunner {
           );
         } catch (error) {
           this.lastError =
-            error instanceof Error
-              ? error.message
-              : String(error);
+            this.errorToMessage(error);
 
           logger.error(
             `Failed to process ${symbol}:`,
@@ -200,10 +217,17 @@ export class BotRunner {
             this.lastError
           );
 
-          await telegramService.notifyError(
-            `Обработка ${symbol}`,
-            error
-          );
+          try {
+            await telegramService.notifyError(
+              `Обработка ${symbol}`,
+              error
+            );
+          } catch (notificationError) {
+            logger.error(
+              `Failed to send error notification for ${symbol}:`,
+              notificationError
+            );
+          }
         }
       }
     } finally {
@@ -215,14 +239,15 @@ export class BotRunner {
     symbol: string
   ): Promise<void> {
     const currentPrice =
-      await this.getCurrentPrice(
-        symbol
-      );
+      await this.getCurrentPrice(symbol);
+
+    this.validatePrice(
+      currentPrice,
+      `current price for ${symbol}`
+    );
 
     const existingPosition =
-      positionService.getPosition(
-        symbol
-      );
+      positionService.getPosition(symbol);
 
     if (
       existingPosition &&
@@ -276,36 +301,59 @@ export class BotRunner {
       csvLogService.logEvent(
         "not_enough_data",
         symbol,
-        "Not enough candles"
+        "Not enough candles",
+        {
+          candles1m: candles1m.length,
+          candles5m: candles5m.length
+        }
       );
 
       return;
     }
 
-    const latestCandle =
-      candles1m[
-        candles1m.length - 1
-      ];
+    /*
+     * Сигнал строится по предпоследней
+     * закрытой 1m-свече.
+     *
+     * Последняя свеча может быть текущей
+     * и ещё не завершённой.
+     */
+    const signalCandle =
+      candles1m[candles1m.length - 2];
+
+    if (!signalCandle) {
+      csvLogService.logEvent(
+        "missing_signal_candle",
+        symbol,
+        "Closed signal candle is unavailable"
+      );
+
+      return;
+    }
 
     if (
       this.isCandleAlreadyProcessed(
         symbol,
-        latestCandle.time
+        signalCandle.time
       )
     ) {
       return;
     }
-
-    this.lastProcessedCandle.set(
-      symbol,
-      latestCandle.time
-    );
 
     const decision =
       this.calculateDecision(
         candles1m,
         candles5m
       );
+
+    /*
+     * Помечаем свечу обработанной
+     * только после завершения расчёта решения.
+     */
+    this.lastProcessedCandle.set(
+      symbol,
+      signalCandle.time
+    );
 
     if (
       !decision.accepted ||
@@ -332,7 +380,49 @@ export class BotRunner {
         "signal_cooldown",
         symbol,
         "Signal rejected by cooldown",
-        decision.signal
+        {
+          signal: decision.signal,
+          cooldownBars:
+            this.params.cooldownBars
+        }
+      );
+
+      return;
+    }
+
+    const signal =
+      decision.signal;
+
+    this.validateSignal(
+      signal,
+      symbol
+    );
+
+    const entryDeviation =
+      Math.abs(
+        currentPrice -
+          signal.entryPrice
+      ) /
+      signal.entryPrice;
+
+    const maxEntryDeviation =
+      this.getMaxEntryDeviation();
+
+    if (
+      entryDeviation >
+      maxEntryDeviation
+    ) {
+      csvLogService.logEvent(
+        "entry_price_stale",
+        symbol,
+        "Entry price differs too much from current price",
+        {
+          currentPrice,
+          entryPrice:
+            signal.entryPrice,
+          entryDeviation,
+          maxEntryDeviation
+        }
       );
 
       return;
@@ -342,22 +432,38 @@ export class BotRunner {
       positionService
         .getAvailableBalance();
 
+    this.validatePrice(
+      availableBalance,
+      `available balance for ${symbol}`,
+      true
+    );
+
     const calculatedQuantity =
       this.strategy.calculatePositionSize(
-        decision.signal.entryPrice,
-        decision.signal.stopLossPrice,
+        signal.entryPrice,
+        signal.stopLossPrice,
         availableBalance
       );
 
     const maxQuantity =
       positionService.calculateMaxQuantity(
-        decision.signal.entryPrice
+        signal.entryPrice
       );
 
-    const quantity = Math.min(
-      calculatedQuantity,
-      maxQuantity
-    );
+    const positionStep =
+      this.params.positionSizeStep &&
+      this.params.positionSizeStep > 0
+        ? this.params.positionSizeStep
+        : 1;
+
+    const quantity =
+      this.floorToStep(
+        Math.min(
+          calculatedQuantity,
+          maxQuantity
+        ),
+        positionStep
+      );
 
     if (
       !Number.isFinite(quantity) ||
@@ -370,6 +476,7 @@ export class BotRunner {
         {
           calculatedQuantity,
           maxQuantity,
+          quantity,
           availableBalance,
           currentPositionLimit:
             positionService
@@ -383,20 +490,20 @@ export class BotRunner {
     const position =
       positionService.openPosition({
         symbol,
-        side: decision.signal.side,
+        side: signal.side,
         quantity,
         entryPrice:
-          decision.signal.entryPrice,
+          signal.entryPrice,
         stopLossPrice:
-          decision.signal.stopLossPrice,
+          signal.stopLossPrice,
         takeProfitPrice:
-          decision.signal.takeProfitPrice,
-        signal: decision.signal
+          signal.takeProfitPrice,
+        signal
       });
 
     this.lastSignalCandle.set(
       symbol,
-      decision.signal.signalTime
+      signal.signalTime
     );
 
     csvLogService.logEvent(
@@ -408,6 +515,8 @@ export class BotRunner {
         quantity,
         position,
         availableBalance,
+        currentPrice,
+        entryDeviation,
         currentPositionLimit:
           positionService
             .getCurrentPositionLimit()
@@ -432,7 +541,7 @@ export class BotRunner {
     /*
      * Последняя свеча считается текущей.
      * Сигнал строится по предпоследней
-     * закрытой свече.
+     * закрытой свечке.
      */
     const signalIndex =
       candles1m.length - 2;
@@ -455,7 +564,10 @@ export class BotRunner {
         symbol
       );
 
-    return lastTime === candleTime;
+    return (
+      lastTime !== undefined &&
+      lastTime >= candleTime
+    );
   }
 
   private isCooldownActive(
@@ -467,15 +579,40 @@ export class BotRunner {
         symbol
       );
 
-    if (!lastSignal) {
+    if (
+      lastSignal === undefined
+    ) {
       return false;
+    }
+
+    const signalTime =
+      this.normalizeTimestamp(
+        signal.signalTime
+      );
+
+    const lastSignalTime =
+      this.normalizeTimestamp(
+        lastSignal
+      );
+
+    const elapsedMs =
+      signalTime - lastSignalTime;
+
+    if (elapsedMs < 0) {
+      logger.warn(
+        `Signal time moved backwards for ${symbol}: ` +
+          `last=${lastSignalTime}, ` +
+          `current=${signalTime}`
+      );
+
+      return true;
     }
 
     const timeframeMs =
       60 * 1000;
 
     return (
-      signal.signalTime - lastSignal <
+      elapsedMs <
       this.params.cooldownBars *
         timeframeMs
     );
@@ -487,6 +624,178 @@ export class BotRunner {
     return this.strategy.getCurrentPrice(
       symbol
     );
+  }
+
+  private validatePrice(
+    value: number,
+    label: string,
+    allowZero = false
+  ): void {
+    const isValid =
+      Number.isFinite(value) &&
+      (
+        allowZero
+          ? value >= 0
+          : value > 0
+      );
+
+    if (!isValid) {
+      throw new Error(
+        `Invalid ${label}: ${value}`
+      );
+    }
+  }
+
+  private validateSignal(
+    signal: ScalpSignal,
+    symbol: string
+  ): void {
+    this.validatePrice(
+      signal.entryPrice,
+      `entry price for ${symbol}`
+    );
+
+    this.validatePrice(
+      signal.stopLossPrice,
+      `stop-loss price for ${symbol}`
+    );
+
+    this.validatePrice(
+      signal.takeProfitPrice,
+      `take-profit price for ${symbol}`
+    );
+
+    this.validatePrice(
+      signal.riskDistance,
+      `risk distance for ${symbol}`
+    );
+
+    if (
+      signal.side === "long" &&
+      (
+        signal.stopLossPrice >=
+          signal.entryPrice ||
+        signal.takeProfitPrice <=
+          signal.entryPrice
+      )
+    ) {
+      throw new Error(
+        `Invalid long signal levels for ${symbol}: ` +
+          `entry=${signal.entryPrice}, ` +
+          `stop=${signal.stopLossPrice}, ` +
+          `takeProfit=${signal.takeProfitPrice}`
+      );
+    }
+
+    if (
+      signal.side === "short" &&
+      (
+        signal.stopLossPrice <=
+          signal.entryPrice ||
+        signal.takeProfitPrice >=
+          signal.entryPrice
+      )
+    ) {
+      throw new Error(
+        `Invalid short signal levels for ${symbol}: ` +
+          `entry=${signal.entryPrice}, ` +
+          `stop=${signal.stopLossPrice}, ` +
+          `takeProfit=${signal.takeProfitPrice}`
+      );
+    }
+  }
+
+  private getMaxEntryDeviation(): number {
+    const value =
+      Number(
+        process.env.MAX_ENTRY_DEVIATION_PCT ||
+          "0.15"
+      );
+
+    if (
+      !Number.isFinite(value) ||
+      value < 0
+    ) {
+      return 0.0015;
+    }
+
+    /*
+     * Переменная задаётся в процентах:
+     * 0.15 означает 0.15%.
+     */
+    return value / 100;
+  }
+
+  private floorToStep(
+    value: number,
+    step: number
+  ): number {
+    if (
+      !Number.isFinite(value) ||
+      !Number.isFinite(step) ||
+      step <= 0
+    ) {
+      return 0;
+    }
+
+    return Math.floor(
+      value / step
+    ) * step;
+  }
+
+  private normalizeTimestamp(
+    value: number
+  ): number {
+    if (
+      !Number.isFinite(value)
+    ) {
+      return 0;
+    }
+
+    /*
+     * API иногда может вернуть Unix time
+     * в секундах, а внутренний код использует
+     * миллисекунды.
+     */
+    return value < 10_000_000_000
+      ? value * 1000
+      : value;
+  }
+
+  private errorToMessage(
+    error: unknown
+  ): string {
+    return error instanceof Error
+      ? error.message
+      : String(error);
+  }
+
+  private handleCycleError(
+    message: string,
+    error: unknown
+  ): void {
+    this.lastError =
+      this.errorToMessage(error);
+
+    logger.error(
+      message,
+      error
+    );
+
+    csvLogService.logEvent(
+      "cycle_error",
+      "",
+      this.lastError
+    );
+
+    void telegramService
+      .notifyError(message, error)
+      .catch((notificationError) => {
+        logger.error(
+          "Failed to send cycle error notification:",
+          notificationError
+        );
+      });
   }
 }
 
