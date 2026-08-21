@@ -294,14 +294,20 @@ export class BotRunner {
           config.candles5mMinutes
         );
 
+    /*
+     * Require a small buffer of candles so that
+     * indicator warm-up and ATR alignment have enough data.
+     * The strategy itself will still reject signals
+     * with not_enough_history if needed.
+     */
     if (
-      candles1m.length < 3 ||
-      candles5m.length < 3
+      candles1m.length < 5 ||
+      candles5m.length < 5
     ) {
       csvLogService.logEvent(
         "not_enough_data",
         symbol,
-        "Not enough candles",
+        "Not enough candles for indicators",
         {
           candles1m: candles1m.length,
           candles5m: candles5m.length
@@ -312,14 +318,14 @@ export class BotRunner {
     }
 
     /*
-     * Сигнал строится по предпоследней
-     * закрытой 1m-свече.
-     *
-     * Последняя свеча может быть текущей
-     * и ещё не завершённой.
+     * Signal is built on the last closed 1m candle.
+     * The last candle in the array may still be forming.
      */
+    const signalIndex =
+      candles1m.length - 2;
+
     const signalCandle =
-      candles1m[candles1m.length - 2];
+      candles1m[signalIndex];
 
     if (!signalCandle) {
       csvLogService.logEvent(
@@ -343,12 +349,13 @@ export class BotRunner {
     const decision =
       this.calculateDecision(
         candles1m,
-        candles5m
+        candles5m,
+        signalIndex
       );
 
     /*
-     * Помечаем свечу обработанной
-     * только после завершения расчёта решения.
+     * Mark the candle as processed only after
+     * the decision calculation has completed.
      */
     this.lastProcessedCandle.set(
       symbol,
@@ -501,9 +508,13 @@ export class BotRunner {
         signal
       });
 
+    /*
+     * Cooldown is tracked by the entry time,
+     * i.e. the moment when the trade is actually executed.
+     */
     this.lastSignalCandle.set(
       symbol,
-      signal.signalTime
+      signal.entryTime
     );
 
     csvLogService.logEvent(
@@ -526,7 +537,8 @@ export class BotRunner {
 
   private calculateDecision(
     candles1m: Candle[],
-    candles5m: Candle[]
+    candles5m: Candle[],
+    signalIndex: number
   ): EntryDecision {
     const indicators1m =
       this.strategy.build1mIndicators(
@@ -537,14 +549,6 @@ export class BotRunner {
       this.strategy.build5mIndicators(
         candles5m
       );
-
-    /*
-     * Последняя свеча считается текущей.
-     * Сигнал строится по предпоследней
-     * закрытой свечке.
-     */
-    const signalIndex =
-      candles1m.length - 2;
 
     return this.strategy.evaluateEntry(
       candles1m,
@@ -585,15 +589,15 @@ export class BotRunner {
       return false;
     }
 
+    /*
+     * All timestamps inside ScalpSignal are in milliseconds
+     * and come from candle.time, so no normalization is needed.
+     */
     const signalTime =
-      this.normalizeTimestamp(
-        signal.signalTime
-      );
+      signal.entryTime;
 
     const lastSignalTime =
-      this.normalizeTimestamp(
-        lastSignal
-      );
+      lastSignal;
 
     const elapsedMs =
       signalTime - lastSignalTime;
@@ -720,8 +724,8 @@ export class BotRunner {
     }
 
     /*
-     * Переменная задаётся в процентах:
-     * 0.15 означает 0.15%.
+     * Variable is specified in percent:
+     * 0.15 means 0.15%.
      */
     return value / 100;
   }
@@ -741,25 +745,6 @@ export class BotRunner {
     return Math.floor(
       value / step
     ) * step;
-  }
-
-  private normalizeTimestamp(
-    value: number
-  ): number {
-    if (
-      !Number.isFinite(value)
-    ) {
-      return 0;
-    }
-
-    /*
-     * API иногда может вернуть Unix time
-     * в секундах, а внутренний код использует
-     * миллисекунды.
-     */
-    return value < 10_000_000_000
-      ? value * 1000
-      : value;
   }
 
   private errorToMessage(
