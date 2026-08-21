@@ -193,9 +193,9 @@ export const DEFAULT_SCALP_PARAMS: ScalpParams = {
   vwapPeriod1m: 60,
   volumeLookback1m: 60,
 
-  trendAtrLookback5m: 20,
-  trendAtrExpandRatio5m: 1.05,
-  atrExpansionTolerance5m: 0.995,
+  trendAtrLookback5m: 3,
+  trendAtrExpandRatio5m: 1.01,
+  atrExpansionTolerance5m: 0.97,
 
   pullbackLookback1m: 6,
   breakoutBufferPct: 0.00015,
@@ -322,6 +322,41 @@ function alignDerivedSeries(
   }
 
   return result;
+}
+
+function buildAtrSeries(
+  candles: Candle[],
+  period: number
+): Array<number | null> {
+  const result: Array<number | null> =
+    Array(candles.length).fill(null);
+
+  if (candles.length <= period) {
+    return result;
+  }
+
+  const atrRaw = ATR.calculate({
+    high: candles.map(
+      candle => candle.high
+    ),
+    low: candles.map(
+      candle => candle.low
+    ),
+    close: candles.map(
+      candle => candle.close
+    ),
+    period
+  });
+
+  /*
+   * ATR requires the previous close for True Range.
+   * With period N, the first ATR belongs to candle index N.
+   */
+  return alignDerivedSeries(
+    atrRaw,
+    period,
+    candles.length
+  );
 }
 
 function mergeBucket(
@@ -452,18 +487,10 @@ export function build1mIndicators(
     }));
   }
 
-  const atrRaw = ATR.calculate({
-    high: candles.map(
-      candle => candle.high
-    ),
-    low: candles.map(
-      candle => candle.low
-    ),
-    close: candles.map(
-      candle => candle.close
-    ),
-    period: params.atrPeriod1m
-  });
+  const atrSeries = buildAtrSeries(
+    candles,
+    params.atrPeriod1m
+  );
 
   const volumeSmaRaw = SMA.calculate({
     period: params.volumeLookback1m,
@@ -471,11 +498,6 @@ export function build1mIndicators(
       candle => candle.volume
     )
   });
-
-  const atrSeries = padSeries(
-    atrRaw,
-    candles.length
-  );
 
   const volumeSmaSeries =
     padSeries(
@@ -552,21 +574,71 @@ export function build5mIndicators(
     candle => candle.close
   );
 
-  const atrRaw = ATR.calculate({
-    high: candles5m.map(
-      candle => candle.high
-    ),
-    low: candles5m.map(
-      candle => candle.low
-    ),
-    close: closes,
-    period: params.atrPeriod5m
-  });
+  const atrSeries = buildAtrSeries(
+    candles5m,
+    params.atrPeriod5m
+  );
+
+  const atrValues: number[] = [];
+  const atrIndexes: number[] = [];
+
+  for (
+    let index = 0;
+    index < atrSeries.length;
+    index++
+  ) {
+    const value = atrSeries[index];
+
+    if (isFinitePositive(value)) {
+      atrValues.push(value);
+      atrIndexes.push(index);
+    }
+  }
 
   const atrSmaRaw = SMA.calculate({
     period: params.trendAtrLookback5m,
-    values: atrRaw
+    values: atrValues
   });
+
+  const atrSmaSeries: Array<number | null> =
+    Array(candles5m.length).fill(null);
+
+  if (
+    atrSmaRaw.length > 0 &&
+    atrIndexes.length >=
+      params.trendAtrLookback5m
+  ) {
+    const firstAtrSmaIndex =
+      atrIndexes[
+        params.trendAtrLookback5m - 1
+      ];
+
+    const firstAtrSmaRawIndex =
+      atrIndexes.indexOf(
+        firstAtrSmaIndex
+      );
+
+    for (
+      let i = 0;
+      i < atrSmaRaw.length;
+      i++
+    ) {
+      const atrValueIndex =
+        firstAtrSmaRawIndex + i;
+
+      const candleIndex =
+        atrIndexes[atrValueIndex];
+
+      if (
+        candleIndex !== undefined &&
+        candleIndex >= 0 &&
+        candleIndex < candles5m.length
+      ) {
+        atrSmaSeries[candleIndex] =
+          atrSmaRaw[i];
+      }
+    }
+  }
 
   const emaFastRaw = EMA.calculate({
     period: params.emaFastPeriod5m,
@@ -578,11 +650,6 @@ export function build5mIndicators(
     values: closes
   });
 
-  const atrSeries = padSeries(
-    atrRaw,
-    candles5m.length
-  );
-
   const emaFastSeries = padSeries(
     emaFastRaw,
     candles5m.length
@@ -592,18 +659,6 @@ export function build5mIndicators(
     emaSlowRaw,
     candles5m.length
   );
-
-  const atrSmaFirstIndex =
-    params.atrPeriod5m +
-    params.trendAtrLookback5m -
-    2;
-
-  const atrSmaSeries =
-    alignDerivedSeries(
-      atrSmaRaw,
-      atrSmaFirstIndex,
-      candles5m.length
-    );
 
   return candles5m.map(
     (_candle, index) => ({
@@ -717,20 +772,18 @@ function calcCloseLocation(
 }
 
 function calcVolumeRatio(
-  candle: Candle,
-  indicators: BarIndicators1m
+  volume: number,
+  baselineVolume: number | null
 ): number {
   if (
-    indicators.volumeSma1m === null ||
-    indicators.volumeSma1m <= 0
+    baselineVolume === null ||
+    !Number.isFinite(baselineVolume) ||
+    baselineVolume <= 0
   ) {
     return 0;
   }
 
-  return (
-    candle.volume /
-    indicators.volumeSma1m
-  );
+  return volume / baselineVolume;
 }
 
 function calcDistancePct(
@@ -1503,32 +1556,68 @@ export function evaluateMomentumScalpEntry(
   const previousAtr =
     previousCtx5m?.atr5m;
 
-  const atrHasPreviousValue =
-    Number.isFinite(previousAtr) &&
-    Number(previousAtr) > 0;
+  const trendAtrIndex =
+    idx5m -
+    params.trendAtrLookback5m;
 
-  const atrSmaThreshold =
-    ctx5m.atr5mSma *
-    params.trendAtrExpandRatio5m;
-
-  const previousAtrThreshold =
-    atrHasPreviousValue
-      ? Number(previousAtr) *
-        params.atrExpansionTolerance5m
+  const trendAtr =
+    trendAtrIndex >= 0
+      ? indicators5m[
+          trendAtrIndex
+        ]?.atr5m
       : null;
 
-  const atrAboveAverage =
-    ctx5m.atr5m >=
-    atrSmaThreshold;
+  const hasPreviousAtr =
+    isFinitePositive(previousAtr);
 
-  const atrNotContracting =
-    !atrHasPreviousValue ||
-    ctx5m.atr5m >=
-      Number(previousAtrThreshold);
+  const hasTrendAtr =
+    isFinitePositive(trendAtr);
+
+  const atrVsSma =
+    ctx5m.atr5m /
+    ctx5m.atr5mSma;
+
+  const atrVsPrevious =
+    hasPreviousAtr
+      ? ctx5m.atr5m /
+        Number(previousAtr)
+      : null;
+
+  const atrVsTrend =
+    hasTrendAtr
+      ? ctx5m.atr5m /
+        Number(trendAtr)
+      : null;
+
+  /*
+   * ATR should not be in a clearly compressed volatility regime.
+   * A value of 0.98 allows ATR slightly below its SMA.
+   */
+  const atrNotLow =
+    atrVsSma >= 0.98;
+
+  /*
+   * Minor ATR pullback is normal after an impulse.
+   * With default 0.97 ATR may contract by up to 3%.
+   */
+  const atrNotSharplyContracting =
+    atrVsPrevious === null ||
+    atrVsPrevious >=
+      params.atrExpansionTolerance5m;
+
+  /*
+   * Actual ATR expansion check over trendAtrLookback5m.
+   * With defaults: ATR must grow at least 1% over 3 closed 5m bars.
+   */
+  const atrTrendExpanding =
+    atrVsTrend !== null &&
+    atrVsTrend >=
+      params.trendAtrExpandRatio5m;
 
   const atrExpanding =
-    atrAboveAverage &&
-    atrNotContracting;
+    atrNotLow &&
+    atrNotSharplyContracting &&
+    atrTrendExpanding;
 
   if (!atrExpanding) {
     return {
@@ -1537,13 +1626,25 @@ export function evaluateMomentumScalpEntry(
       diagnostics: {
         currentAtr: ctx5m.atr5m,
         atrSma: ctx5m.atr5mSma,
-        previousAtr: atrHasPreviousValue
-          ? Number(previousAtr)
-          : null,
-        atrSmaThreshold,
-        previousAtrThreshold,
-        atrAboveAverage,
-        atrNotContracting,
+        previousAtr:
+          hasPreviousAtr
+            ? Number(previousAtr)
+            : null,
+        trendAtr:
+          hasTrendAtr
+            ? Number(trendAtr)
+            : null,
+
+        atrVsSma,
+        atrVsPrevious,
+        atrVsTrend,
+
+        atrNotLow,
+        atrNotSharplyContracting,
+        atrTrendExpanding,
+
+        trendAtrLookback5m:
+          params.trendAtrLookback5m,
         trendAtrExpandRatio5m:
           params.trendAtrExpandRatio5m,
         atrExpansionTolerance5m:
@@ -1552,10 +1653,18 @@ export function evaluateMomentumScalpEntry(
     };
   }
 
+  /*
+   * Compare signal candle volume with the SMA that existed
+   * before the signal candle, so its own volume does not lower
+   * its volume ratio artificially.
+   */
+  const previousInd1m =
+    indicators1m[signalIndex - 1];
+
   const volumeRatio =
     calcVolumeRatio(
-      signalCandle,
-      ind1m
+      signalCandle.volume,
+      previousInd1m?.volumeSma1m ?? null
     );
 
   if (
@@ -2062,13 +2171,6 @@ export class ScalpStrategy {
         signalIndex
       );
 
-    /*
-     * Важно:
-     * здесь signal имеет тип
-     * ScalpSignal | undefined.
-     *
-     * Не используем signal.side напрямую.
-     */
     const signal =
       decision.signal;
 
