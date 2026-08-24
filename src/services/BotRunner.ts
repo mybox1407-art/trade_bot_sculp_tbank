@@ -2,6 +2,7 @@ import config from "../config";
 import {
   Candle,
   EntryDecision,
+  EntryRejectReason,
   ScalpParams,
   ScalpSignal
 } from "../types";
@@ -23,6 +24,23 @@ export interface BotRunnerStatus {
   realizedPnl: number;
 }
 
+interface RejectLogState {
+  reason: string;
+  signalCandleTime: number;
+  closed5mCandleTime: number | null;
+}
+
+interface FilterSummary {
+  total: number;
+  accepted: number;
+  rejected: Record<string, number>;
+}
+
+interface SymbolDecisionContext {
+  signalCandleTime: number;
+  closed5mCandleTime: number | null;
+}
+
 export class BotRunner {
   private readonly strategy: ScalpStrategy;
   private readonly symbols: string[];
@@ -36,11 +54,46 @@ export class BotRunner {
   private lastCycleAt: number | null = null;
   private lastError: string | null = null;
 
+  /*
+   * Protects against evaluating the same closed 1m candle twice.
+   */
   private readonly lastProcessedCandle =
     new Map<string, number>();
 
+  /*
+   * Tracks actual accepted entry times for cooldown handling.
+   */
   private readonly lastSignalCandle =
     new Map<string, number>();
+
+  /*
+   * Tracks the last rejection that was emitted to CSV.
+   * Rejections are logged only when a new 1m candle appears,
+   * a new closed 5m context appears, or rejection reason changes.
+   */
+  private readonly lastRejectLog =
+    new Map<string, RejectLogState>();
+
+  /*
+   * Tracks closed 5m context used for every symbol.
+   * This makes repeated ATR diagnostics explicit.
+   */
+  private readonly lastClosed5mContext =
+    new Map<string, number | null>();
+
+  /*
+   * Aggregated scanner diagnostics.
+   */
+  private summaryStartedAt = Date.now();
+
+  private summary: FilterSummary = {
+    total: 0,
+    accepted: 0,
+    rejected: {}
+  };
+
+  private readonly summaryIntervalMs =
+    5 * 60 * 1000;
 
   constructor(
     strategy: ScalpStrategy,
@@ -71,6 +124,12 @@ export class BotRunner {
     this.running = true;
     this.startedAt = Date.now();
     this.lastError = null;
+    this.summaryStartedAt = Date.now();
+    this.summary = {
+      total: 0,
+      accepted: 0,
+      rejected: {}
+    };
 
     logger.info(
       `BotRunner started for instruments: ` +
@@ -89,7 +148,9 @@ export class BotRunner {
         maxOpenPositions:
           config.maxOpenPositions,
         maxPositionNotionalPct:
-          config.maxPositionNotionalPct
+          config.maxPositionNotionalPct,
+        pollIntervalMs:
+          config.pollIntervalMs
       }
     );
 
@@ -130,6 +191,8 @@ export class BotRunner {
       clearInterval(this.timer);
       this.timer = null;
     }
+
+    this.flushScannerSummary(true);
 
     csvLogService.logEvent(
       "bot_stopped",
@@ -199,9 +262,7 @@ export class BotRunner {
         }
 
         try {
-          await this.processSymbol(
-            symbol
-          );
+          await this.processSymbol(symbol);
         } catch (error) {
           this.lastError =
             this.errorToMessage(error);
@@ -230,6 +291,8 @@ export class BotRunner {
           }
         }
       }
+
+      this.flushScannerSummary();
     } finally {
       this.cycleInProgress = false;
     }
@@ -294,12 +357,6 @@ export class BotRunner {
           config.candles5mMinutes
         );
 
-    /*
-     * Require a small buffer of candles so that
-     * indicator warm-up and ATR alignment have enough data.
-     * The strategy itself will still reject signals
-     * with not_enough_history if needed.
-     */
     if (
       candles1m.length < 5 ||
       candles5m.length < 5
@@ -317,10 +374,6 @@ export class BotRunner {
       return;
     }
 
-    /*
-     * Signal is built on the last closed 1m candle.
-     * The last candle in the array may still be forming.
-     */
     const signalIndex =
       candles1m.length - 2;
 
@@ -346,6 +399,30 @@ export class BotRunner {
       return;
     }
 
+    const closed5mCandleTime =
+      this.getClosed5mCandleTime(
+        signalCandle.time,
+        candles5m
+      );
+
+    const decisionContext: SymbolDecisionContext = {
+      signalCandleTime:
+        signalCandle.time,
+      closed5mCandleTime
+    };
+
+    const previousClosed5mContext =
+      this.lastClosed5mContext.get(symbol);
+
+    const closed5mChanged =
+      previousClosed5mContext !==
+      closed5mCandleTime;
+
+    this.lastClosed5mContext.set(
+      symbol,
+      closed5mCandleTime
+    );
+
     const decision =
       this.calculateDecision(
         candles1m,
@@ -353,29 +430,28 @@ export class BotRunner {
         signalIndex
       );
 
-    /*
-     * Mark the candle as processed only after
-     * the decision calculation has completed.
-     */
     this.lastProcessedCandle.set(
       symbol,
       signalCandle.time
     );
 
+    this.summary.total += 1;
+
     if (
       !decision.accepted ||
       !decision.signal
     ) {
-      csvLogService.logEvent(
-        "signal_rejected",
+      this.recordRejectedDecision(
         symbol,
-        decision.reason ||
-          "no_signal",
-        decision
+        decision,
+        decisionContext,
+        closed5mChanged
       );
 
       return;
     }
+
+    this.summary.accepted += 1;
 
     if (
       this.isCooldownActive(
@@ -390,7 +466,10 @@ export class BotRunner {
         {
           signal: decision.signal,
           cooldownBars:
-            this.params.cooldownBars
+            this.params.cooldownBars,
+          signalCandleTime:
+            signalCandle.time,
+          closed5mCandleTime
         }
       );
 
@@ -428,7 +507,10 @@ export class BotRunner {
           entryPrice:
             signal.entryPrice,
           entryDeviation,
-          maxEntryDeviation
+          maxEntryDeviation,
+          signalCandleTime:
+            signalCandle.time,
+          closed5mCandleTime
         }
       );
 
@@ -487,7 +569,10 @@ export class BotRunner {
           availableBalance,
           currentPositionLimit:
             positionService
-              .getCurrentPositionLimit()
+              .getCurrentPositionLimit(),
+          signalCandleTime:
+            signalCandle.time,
+          closed5mCandleTime
         }
       );
 
@@ -508,14 +593,12 @@ export class BotRunner {
         signal
       });
 
-    /*
-     * Cooldown is tracked by the entry time,
-     * i.e. the moment when the trade is actually executed.
-     */
     this.lastSignalCandle.set(
       symbol,
       signal.entryTime
     );
+
+    this.lastRejectLog.delete(symbol);
 
     csvLogService.logEvent(
       "signal_accepted",
@@ -530,9 +613,189 @@ export class BotRunner {
         entryDeviation,
         currentPositionLimit:
           positionService
-            .getCurrentPositionLimit()
+            .getCurrentPositionLimit(),
+        signalCandleTime:
+          signalCandle.time,
+        closed5mCandleTime
       }
     );
+  }
+
+  private recordRejectedDecision(
+    symbol: string,
+    decision: EntryDecision,
+    context: SymbolDecisionContext,
+    closed5mChanged: boolean
+  ): void {
+    const reason =
+      decision.reason || "no_signal";
+
+    this.summary.rejected[reason] =
+      (this.summary.rejected[reason] || 0) + 1;
+
+    if (
+      !this.shouldLogRejectedDecision(
+        symbol,
+        reason,
+        context,
+        closed5mChanged
+      )
+    ) {
+      return;
+    }
+
+    csvLogService.logEvent(
+      "signal_rejected",
+      symbol,
+      reason,
+      {
+        ...decision,
+        signalCandleTime:
+          context.signalCandleTime,
+        closed5mCandleTime:
+          context.closed5mCandleTime,
+        note:
+          "Rejection logged after state change only"
+      }
+    );
+  }
+
+  private shouldLogRejectedDecision(
+    symbol: string,
+    reason: string,
+    context: SymbolDecisionContext,
+    closed5mChanged: boolean
+  ): boolean {
+    const previous =
+      this.lastRejectLog.get(symbol);
+
+    const reasonChanged =
+      previous === undefined ||
+      previous.reason !== reason;
+
+    const signalCandleChanged =
+      previous === undefined ||
+      previous.signalCandleTime !==
+        context.signalCandleTime;
+
+    const closed5mCandleChanged =
+      previous === undefined ||
+      previous.closed5mCandleTime !==
+        context.closed5mCandleTime;
+
+    /*
+     * Always log a changed rejection reason.
+     * For ATR-related rejection, log only when the closed 5m
+     * context changes; this avoids repeated messages when the
+     * same 5m ATR values are reused across 1m scanner cycles.
+     */
+    const isAtrReject =
+      reason === "atr_not_expanding";
+
+    const shouldLog =
+      reasonChanged ||
+      (
+        !isAtrReject &&
+        signalCandleChanged
+      ) ||
+      (
+        isAtrReject &&
+        (
+          closed5mCandleChanged ||
+          closed5mChanged
+        )
+      );
+
+    if (!shouldLog) {
+      return false;
+    }
+
+    this.lastRejectLog.set(symbol, {
+      reason,
+      signalCandleTime:
+        context.signalCandleTime,
+      closed5mCandleTime:
+        context.closed5mCandleTime
+    });
+
+    return true;
+  }
+
+  private getClosed5mCandleTime(
+    signalCandleTime: number,
+    candles5m: Candle[]
+  ): number | null {
+    const currentBucketStart =
+      Math.floor(
+        signalCandleTime /
+          (5 * 60 * 1000)
+      ) *
+      (5 * 60 * 1000);
+
+    const lastClosedBucketStart =
+      currentBucketStart -
+      5 * 60 * 1000;
+
+    let result: number | null = null;
+
+    for (const candle of candles5m) {
+      if (
+        candle.time <=
+        lastClosedBucketStart
+      ) {
+        result = candle.time;
+      } else {
+        break;
+      }
+    }
+
+    return result;
+  }
+
+  private flushScannerSummary(
+    force = false
+  ): void {
+    const now = Date.now();
+
+    if (
+      !force &&
+      now - this.summaryStartedAt <
+        this.summaryIntervalMs
+    ) {
+      return;
+    }
+
+    if (this.summary.total === 0) {
+      this.summaryStartedAt = now;
+
+      return;
+    }
+
+    csvLogService.logEvent(
+      "scanner_summary",
+      "",
+      "Aggregated signal scanner statistics",
+      {
+        startedAt:
+          this.summaryStartedAt,
+        finishedAt: now,
+        periodMs:
+          now - this.summaryStartedAt,
+        totalEvaluations:
+          this.summary.total,
+        accepted:
+          this.summary.accepted,
+        rejected:
+          this.summary.rejected
+      }
+    );
+
+    this.summaryStartedAt = now;
+    this.summary = {
+      total: 0,
+      accepted: 0,
+      rejected: {}
+    };
   }
 
   private calculateDecision(
@@ -589,23 +852,16 @@ export class BotRunner {
       return false;
     }
 
-    /*
-     * All timestamps inside ScalpSignal are in milliseconds
-     * and come from candle.time, so no normalization is needed.
-     */
     const signalTime =
       signal.entryTime;
 
-    const lastSignalTime =
-      lastSignal;
-
     const elapsedMs =
-      signalTime - lastSignalTime;
+      signalTime - lastSignal;
 
     if (elapsedMs < 0) {
       logger.warn(
         `Signal time moved backwards for ${symbol}: ` +
-          `last=${lastSignalTime}, ` +
+          `last=${lastSignal}, ` +
           `current=${signalTime}`
       );
 
@@ -723,10 +979,6 @@ export class BotRunner {
       return 0.0015;
     }
 
-    /*
-     * Variable is specified in percent:
-     * 0.15 means 0.15%.
-     */
     return value / 100;
   }
 
