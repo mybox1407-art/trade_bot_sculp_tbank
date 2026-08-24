@@ -109,10 +109,28 @@ export interface ScalpSignal {
   expectedNetTargetMovePct: number;
 }
 
+export interface EntryChecks {
+  atrNotLow: boolean | null;
+  atrNotSharplyContracting: boolean | null;
+  atrAboveTrend: boolean | null;
+  atrTrendThresholdPassed: boolean | null;
+  atrPassed: boolean | null;
+  volumePassed: boolean | null;
+  impulseBodyPassed: boolean | null;
+  vwapDistancePassed: boolean | null;
+  trendPassed: boolean | null;
+  directionalImpulsePassed: boolean | null;
+  pullbackPassed: boolean | null;
+  breakoutPassed: boolean | null;
+  targetPassed: boolean | null;
+}
+
 export interface EntryDecision {
   accepted: boolean;
   reason?: EntryRejectReason;
   signal?: ScalpSignal;
+  checks?: EntryChecks;
+  failedChecks?: string[];
   diagnostics?: Record<
     string,
     number | boolean | null
@@ -348,10 +366,6 @@ function buildAtrSeries(
     period
   });
 
-  /*
-   * ATR requires the previous close for True Range.
-   * With period N, the first ATR belongs to candle index N.
-   */
   return alignDerivedSeries(
     atrRaw,
     period,
@@ -1171,6 +1185,32 @@ function hasEnoughTargetAfterCosts(
   );
 }
 
+function createEntryChecks(): EntryChecks {
+  return {
+    atrNotLow: null,
+    atrNotSharplyContracting: null,
+    atrAboveTrend: null,
+    atrTrendThresholdPassed: null,
+    atrPassed: null,
+    volumePassed: null,
+    impulseBodyPassed: null,
+    vwapDistancePassed: null,
+    trendPassed: null,
+    directionalImpulsePassed: null,
+    pullbackPassed: null,
+    breakoutPassed: null,
+    targetPassed: null
+  };
+}
+
+function getFailedChecks(
+  checks: EntryChecks
+): string[] {
+  return Object.entries(checks)
+    .filter(([, value]) => value === false)
+    .map(([name]) => name);
+}
+
 function createLongSignal(
   candles1m: Candle[],
   indicators1m: BarIndicators1m[],
@@ -1230,19 +1270,6 @@ function createLongSignal(
     ind1m.atr1m *
     params.atrTpMult;
 
-  const targetMovePct =
-    (takeProfitPrice - entryPrice) /
-    entryPrice;
-
-  if (
-    !hasEnoughTargetAfterCosts(
-      targetMovePct,
-      params
-    )
-  ) {
-    return null;
-  }
-
   const signalCandle =
     candles1m[signalIndex];
 
@@ -1301,7 +1328,7 @@ function createLongSignal(
       getRoundTripCostPct(params),
 
     expectedNetTargetMovePct:
-      targetMovePct -
+      (takeProfitPrice - entryPrice) / entryPrice -
       getRoundTripCostPct(params)
   };
 }
@@ -1365,20 +1392,6 @@ function createShortSignal(
     ind1m.atr1m *
     params.atrTpMult;
 
-  const targetMovePct =
-    (entryPrice -
-      takeProfitPrice) /
-    entryPrice;
-
-  if (
-    !hasEnoughTargetAfterCosts(
-      targetMovePct,
-      params
-    )
-  ) {
-    return null;
-  }
-
   const signalCandle =
     candles1m[signalIndex];
 
@@ -1437,7 +1450,7 @@ function createShortSignal(
       getRoundTripCostPct(params),
 
     expectedNetTargetMovePct:
-      targetMovePct -
+      (entryPrice - takeProfitPrice) / entryPrice -
       getRoundTripCostPct(params)
   };
 }
@@ -1459,7 +1472,9 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: "invalid_data"
+      reason: "invalid_data",
+      checks: createEntryChecks(),
+      failedChecks: ["invalid_data"]
     };
   }
 
@@ -1470,7 +1485,9 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: "not_enough_history"
+      reason: "not_enough_history",
+      checks: createEntryChecks(),
+      failedChecks: ["not_enough_history"]
     };
   }
 
@@ -1495,7 +1512,9 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: "outside_session"
+      reason: "outside_session",
+      checks: createEntryChecks(),
+      failedChecks: ["outside_session"]
     };
   }
 
@@ -1508,7 +1527,9 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: "missing_context"
+      reason: "missing_context",
+      checks: createEntryChecks(),
+      failedChecks: ["missing_context"]
     };
   }
 
@@ -1524,7 +1545,9 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: "missing_context"
+      reason: "missing_context",
+      checks: createEntryChecks(),
+      failedChecks: ["missing_context"]
     };
   }
 
@@ -1549,9 +1572,13 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: "missing_context"
+      reason: "missing_context",
+      checks: createEntryChecks(),
+      failedChecks: ["missing_context"]
     };
   }
+
+  const checks = createEntryChecks();
 
   const previousAtr =
     previousCtx5m?.atr5m;
@@ -1589,27 +1616,19 @@ export function evaluateMomentumScalpEntry(
         Number(trendAtr)
       : null;
 
-  /*
-   * ATR should not be in a clearly compressed volatility regime.
-   * A value of 0.98 allows ATR slightly below its SMA.
-   */
   const atrNotLow =
     atrVsSma >= 0.98;
 
-  /*
-   * Minor ATR pullback is normal after an impulse.
-   * With default 0.97 ATR may contract by up to 3%.
-   */
   const atrNotSharplyContracting =
     atrVsPrevious === null ||
     atrVsPrevious >=
       params.atrExpansionTolerance5m;
 
-  /*
-   * Actual ATR expansion check over trendAtrLookback5m.
-   * With defaults: ATR must grow at least 1% over 3 closed 5m bars.
-   */
-  const atrTrendExpanding =
+  const atrAboveTrend =
+    atrVsTrend !== null &&
+    atrVsTrend >= 1;
+
+  const atrTrendThresholdPassed =
     atrVsTrend !== null &&
     atrVsTrend >=
       params.trendAtrExpandRatio5m;
@@ -1617,12 +1636,20 @@ export function evaluateMomentumScalpEntry(
   const atrExpanding =
     atrNotLow &&
     atrNotSharplyContracting &&
-    atrTrendExpanding;
+    atrTrendThresholdPassed;
+
+  checks.atrNotLow = atrNotLow;
+  checks.atrNotSharplyContracting = atrNotSharplyContracting;
+  checks.atrAboveTrend = atrAboveTrend;
+  checks.atrTrendThresholdPassed = atrTrendThresholdPassed;
+  checks.atrPassed = atrExpanding;
 
   if (!atrExpanding) {
     return {
       accepted: false,
       reason: "atr_not_expanding",
+      checks,
+      failedChecks: getFailedChecks(checks),
       diagnostics: {
         currentAtr: ctx5m.atr5m,
         atrSma: ctx5m.atr5mSma,
@@ -1641,7 +1668,8 @@ export function evaluateMomentumScalpEntry(
 
         atrNotLow,
         atrNotSharplyContracting,
-        atrTrendExpanding,
+        atrAboveTrend,
+        atrTrendThresholdPassed,
 
         trendAtrLookback5m:
           params.trendAtrLookback5m,
@@ -1653,11 +1681,6 @@ export function evaluateMomentumScalpEntry(
     };
   }
 
-  /*
-   * Compare signal candle volume with the SMA that existed
-   * before the signal candle, so its own volume does not lower
-   * its volume ratio artificially.
-   */
   const previousInd1m =
     indicators1m[signalIndex - 1];
 
@@ -1667,6 +1690,11 @@ export function evaluateMomentumScalpEntry(
       previousInd1m?.volumeSma1m ?? null
     );
 
+  checks.volumePassed =
+    Number.isFinite(volumeRatio) &&
+    volumeRatio >=
+      params.volumeMinRatio1m;
+
   if (
     !Number.isFinite(volumeRatio) ||
     volumeRatio <
@@ -1674,12 +1702,27 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: "volume_too_small"
+      reason: "volume_too_small",
+      checks,
+      failedChecks: getFailedChecks(checks),
+      diagnostics: {
+        volume: signalCandle.volume,
+        baselineVolume:
+          previousInd1m?.volumeSma1m ?? null,
+        volumeRatio,
+        volumeMinRatio1m:
+          params.volumeMinRatio1m
+      }
     };
   }
 
   const bodyPct =
     calcBodyPct(signalCandle);
+
+  checks.impulseBodyPassed =
+    Number.isFinite(bodyPct) &&
+    bodyPct >=
+      params.minImpulseBodyPct;
 
   if (
     !Number.isFinite(bodyPct) ||
@@ -1688,7 +1731,14 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: "impulse_too_small"
+      reason: "impulse_too_small",
+      checks,
+      failedChecks: getFailedChecks(checks),
+      diagnostics: {
+        bodyPct,
+        minImpulseBodyPct:
+          params.minImpulseBodyPct
+      }
     };
   }
 
@@ -1703,13 +1753,25 @@ export function evaluateMomentumScalpEntry(
       ind1m.vwap1m
     );
 
+  checks.vwapDistancePassed =
+    vwapDistancePct <=
+    params.maxEntryDistanceFromVwapPct;
+
   if (
     vwapDistancePct >
     params.maxEntryDistanceFromVwapPct
   ) {
     return {
       accepted: false,
-      reason: "too_far_from_vwap"
+      reason: "too_far_from_vwap",
+      checks,
+      failedChecks: getFailedChecks(checks),
+      diagnostics: {
+        vwapDistancePct,
+        vwap: ind1m.vwap1m,
+        maxEntryDistanceFromVwapPct:
+          params.maxEntryDistanceFromVwapPct
+      }
     };
   }
 
@@ -1725,13 +1787,25 @@ export function evaluateMomentumScalpEntry(
     ctx5m.close5m <
       ctx5m.emaFast5m;
 
+  checks.trendPassed =
+    is5mLongTrend !== is5mShortTrend;
+
   if (
     is5mLongTrend ===
     is5mShortTrend
   ) {
     return {
       accepted: false,
-      reason: "trend_not_aligned"
+      reason: "trend_not_aligned",
+      checks,
+      failedChecks: getFailedChecks(checks),
+      diagnostics: {
+        is5mLongTrend,
+        is5mShortTrend,
+        emaFast5m: ctx5m.emaFast5m,
+        emaSlow5m: ctx5m.emaSlow5m,
+        close5m: ctx5m.close5m
+      }
     };
   }
 
@@ -1759,7 +1833,13 @@ export function evaluateMomentumScalpEntry(
   ) {
     return {
       accepted: false,
-      reason: "missing_context"
+      reason: "missing_context",
+      checks,
+      failedChecks: getFailedChecks(checks),
+      diagnostics: {
+        recentHigh,
+        recentLow
+      }
     };
   }
 
@@ -1790,6 +1870,11 @@ export function evaluateMomentumScalpEntry(
       signalCandle.close >
       signalCandle.open;
 
+    checks.directionalImpulsePassed =
+      bullishImpulse &&
+      closeLocation >=
+        params.minCloseLocationLong;
+
     if (
       !bullishImpulse ||
       closeLocation <
@@ -1797,9 +1882,22 @@ export function evaluateMomentumScalpEntry(
     ) {
       return {
         accepted: false,
-        reason: "impulse_too_small"
+        reason: "impulse_too_small",
+        checks,
+        failedChecks: getFailedChecks(checks),
+        diagnostics: {
+          bullishImpulse,
+          closeLocation,
+          minCloseLocationLong:
+            params.minCloseLocationLong
+        }
       };
     }
+
+    checks.pullbackPassed =
+      longPullbackPct !== null &&
+      longPullbackPct >=
+        params.minPullbackPct;
 
     if (
       longPullbackPct === null ||
@@ -1808,18 +1906,34 @@ export function evaluateMomentumScalpEntry(
     ) {
       return {
         accepted: false,
-        reason: "pullback_too_small"
+        reason: "pullback_too_small",
+        checks,
+        failedChecks: getFailedChecks(checks),
+        diagnostics: {
+          longPullbackPct,
+          minPullbackPct:
+            params.minPullbackPct
+        }
       };
     }
 
-    const longBreakout =
+    checks.breakoutPassed =
       entryCandle.high >=
       longBreakoutLevel;
 
-    if (!longBreakout) {
+    if (
+      entryCandle.high <
+      longBreakoutLevel
+    ) {
       return {
         accepted: false,
-        reason: "breakout_missing"
+        reason: "breakout_missing",
+        checks,
+        failedChecks: getFailedChecks(checks),
+        diagnostics: {
+          entryHigh: entryCandle.high,
+          longBreakoutLevel
+        }
       };
     }
 
@@ -1843,13 +1957,56 @@ export function evaluateMomentumScalpEntry(
       return {
         accepted: false,
         reason:
-          "target_too_small_for_costs"
+          "target_too_small_for_costs",
+        checks,
+        failedChecks: getFailedChecks(checks),
+        diagnostics: {
+          rawEntryPrice: Math.max(
+            entryCandle.open,
+            longBreakoutLevel
+          ),
+          entryPrice: Math.max(
+            entryCandle.open,
+            longBreakoutLevel
+          ) * (1 + params.slippageRate),
+          takeProfitPrice:
+            Math.max(
+              entryCandle.open,
+              longBreakoutLevel
+            ) * (1 + params.slippageRate) +
+            ind1m.atr1m * params.atrTpMult,
+          targetMovePct:
+            ind1m.atr1m * params.atrTpMult /
+            (Math.max(
+              entryCandle.open,
+              longBreakoutLevel
+            ) * (1 + params.slippageRate)),
+          minTargetMovePct:
+            params.minTargetMovePct,
+          minCostCoverage:
+            params.minCostCoverage,
+          roundTripCostPct:
+            getRoundTripCostPct(params)
+        }
       };
     }
 
+    const longTargetMovePct =
+      (longSignal.takeProfitPrice -
+        longSignal.entryPrice) /
+      longSignal.entryPrice;
+
+    checks.targetPassed =
+      hasEnoughTargetAfterCosts(
+        longTargetMovePct,
+        params
+      );
+
     return {
       accepted: true,
-      signal: longSignal
+      signal: longSignal,
+      checks,
+      failedChecks: []
     };
   }
 
@@ -1858,6 +2015,11 @@ export function evaluateMomentumScalpEntry(
       signalCandle.close <
       signalCandle.open;
 
+    checks.directionalImpulsePassed =
+      bearishImpulse &&
+      closeLocation <=
+        params.maxCloseLocationShort;
+
     if (
       !bearishImpulse ||
       closeLocation >
@@ -1865,9 +2027,22 @@ export function evaluateMomentumScalpEntry(
     ) {
       return {
         accepted: false,
-        reason: "impulse_too_small"
+        reason: "impulse_too_small",
+        checks,
+        failedChecks: getFailedChecks(checks),
+        diagnostics: {
+          bearishImpulse,
+          closeLocation,
+          maxCloseLocationShort:
+            params.maxCloseLocationShort
+        }
       };
     }
+
+    checks.pullbackPassed =
+      shortPullbackPct !== null &&
+      shortPullbackPct >=
+        params.minPullbackPct;
 
     if (
       shortPullbackPct === null ||
@@ -1876,18 +2051,34 @@ export function evaluateMomentumScalpEntry(
     ) {
       return {
         accepted: false,
-        reason: "pullback_too_small"
+        reason: "pullback_too_small",
+        checks,
+        failedChecks: getFailedChecks(checks),
+        diagnostics: {
+          shortPullbackPct,
+          minPullbackPct:
+            params.minPullbackPct
+        }
       };
     }
 
-    const shortBreakout =
+    checks.breakoutPassed =
       entryCandle.low <=
       shortBreakoutLevel;
 
-    if (!shortBreakout) {
+    if (
+      entryCandle.low >
+      shortBreakoutLevel
+    ) {
       return {
         accepted: false,
-        reason: "breakout_missing"
+        reason: "breakout_missing",
+        checks,
+        failedChecks: getFailedChecks(checks),
+        diagnostics: {
+          entryLow: entryCandle.low,
+          shortBreakoutLevel
+        }
       };
     }
 
@@ -1911,19 +2102,64 @@ export function evaluateMomentumScalpEntry(
       return {
         accepted: false,
         reason:
-          "target_too_small_for_costs"
+          "target_too_small_for_costs",
+        checks,
+        failedChecks: getFailedChecks(checks),
+        diagnostics: {
+          rawEntryPrice: Math.min(
+            entryCandle.open,
+            shortBreakoutLevel
+          ),
+          entryPrice: Math.min(
+            entryCandle.open,
+            shortBreakoutLevel
+          ) * (1 - params.slippageRate),
+          takeProfitPrice:
+            Math.min(
+              entryCandle.open,
+              shortBreakoutLevel
+            ) * (1 - params.slippageRate) -
+            ind1m.atr1m * params.atrTpMult,
+          targetMovePct:
+            ind1m.atr1m * params.atrTpMult /
+            (Math.min(
+              entryCandle.open,
+              shortBreakoutLevel
+            ) * (1 - params.slippageRate)),
+          minTargetMovePct:
+            params.minTargetMovePct,
+          minCostCoverage:
+            params.minCostCoverage,
+          roundTripCostPct:
+            getRoundTripCostPct(params)
+        }
       };
     }
 
+    const shortTargetMovePct =
+      (shortSignal.entryPrice -
+        shortSignal.takeProfitPrice) /
+      shortSignal.entryPrice;
+
+    checks.targetPassed =
+      hasEnoughTargetAfterCosts(
+        shortTargetMovePct,
+        params
+      );
+
     return {
       accepted: true,
-      signal: shortSignal
+      signal: shortSignal,
+      checks,
+      failedChecks: []
     };
   }
 
   return {
     accepted: false,
-    reason: "no_signal"
+    reason: "no_signal",
+    checks,
+    failedChecks: getFailedChecks(checks)
   };
 }
 
