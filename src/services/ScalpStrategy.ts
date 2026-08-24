@@ -193,8 +193,8 @@ export const DEFAULT_SCALP_PARAMS: ScalpParams = {
   vwapPeriod1m: 60,
   volumeLookback1m: 60,
 
-  trendAtrLookback5m: 3,
-  trendAtrExpandRatio5m: 1.01,
+  trendAtrLookback5m: 2,
+  trendAtrExpandRatio5m: 1.005,
   atrExpansionTolerance5m: 0.97,
 
   pullbackLookback1m: 6,
