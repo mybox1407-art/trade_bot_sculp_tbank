@@ -66,8 +66,8 @@ export interface ScalpParams {
   minImpulseBodyPct: number;
   volumeMinRatio1m: number;
 
-  minCloseLocationLong?: number;
-  maxCloseLocationShort?: number;
+  minCloseLocationLong: number;
+  maxCloseLocationShort: number;
 
   atrSlMult: number;
   atrTpMult: number;
@@ -121,7 +121,7 @@ export interface ScalpSignal {
   vwap1m: number;
 
   impulseBodyPct: number;
-  closeLocation?: number;
+  closeLocation: number;
   pullbackPct: number;
   volumeRatio: number;
 
@@ -132,10 +132,28 @@ export interface ScalpSignal {
   expectedNetTargetMovePct?: number;
 }
 
+export interface EntryChecks {
+  atrNotLow: boolean | null;
+  atrNotSharplyContracting: boolean | null;
+  atrAboveTrend: boolean | null;
+  atrTrendThresholdPassed: boolean | null;
+  atrPassed: boolean | null;
+  volumePassed: boolean | null;
+  impulseBodyPassed: boolean | null;
+  vwapDistancePassed: boolean | null;
+  trendPassed: boolean | null;
+  directionalImpulsePassed: boolean | null;
+  pullbackPassed: boolean | null;
+  breakoutPassed: boolean | null;
+  targetPassed: boolean | null;
+}
+
 export interface EntryDecision {
   accepted: boolean;
   reason?: EntryRejectReason;
   signal?: ScalpSignal;
+  checks?: EntryChecks;
+  failedChecks?: string[];
 
   /**
    * Диагностические значения фильтров.
