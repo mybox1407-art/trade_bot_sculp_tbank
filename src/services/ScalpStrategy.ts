@@ -213,13 +213,13 @@ export const DEFAULT_SCALP_PARAMS: ScalpParams = {
 
   trendAtrLookback5m: 2,
   trendAtrExpandRatio5m: 1.005,
-  atrExpansionTolerance5m: 0.97,
+  atrExpansionTolerance5m: 0.95,
 
   pullbackLookback1m: 6,
   breakoutBufferPct: 0.00015,
   minPullbackPct: 0.0006,
-  minImpulseBodyPct: 0.0008,
-  volumeMinRatio1m: 1.1,
+  minImpulseBodyPct: 0.0006,
+  volumeMinRatio1m: 1,
 
   minCloseLocationLong: 0.65,
   maxCloseLocationShort: 0.35,
@@ -231,7 +231,7 @@ export const DEFAULT_SCALP_PARAMS: ScalpParams = {
 
   minTargetMovePct: 0.002,
   minCostCoverage: 2.0,
-  maxEntryDistanceFromVwapPct: 0.006,
+  maxEntryDistanceFromVwapPct: 0.008,
   maxPositionNotionalPct: 0.2,
 
   sessionStartHour: 10,
